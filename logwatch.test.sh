@@ -551,6 +551,124 @@ drop_sandbox
 expect_contains "unit: flock still serializes (-n)" "$svc" "flock -n"
 expect_contains "unit: flock contention exits 0 (-E 0)" "$svc" "-E 0"
 
+# --- 29. junk heads: CLI stderr keys BELOW every real line ----------------
+# A container gone mid-scrape leaves only docker's stderr line ("Error:
+# No such container ..."), which has no timestamp. It must key below
+# every real line: a content-derived key like "Error:.000000000" sorts
+# ABOVE "2026-..." heads, so the next fetch's real lines would be
+# classified old, folded into the re-armed boundary and lost forever
+# (never logged, never tallied). Repro: run1 [junk] then run2
+# [ts A, ts B] must emit BOTH real lines.
+new_sandbox
+printf 'Error: No such container: warp-relay-warp-1\n' > "$FIX/docker-fail-warp-relay-warp-1"
+run_watch 1
+expect_eq "junk: run1 records the CLI error" \
+  "$(grep -cF 'No such container' "$LOGS/errors.log")" "1"
+expect_eq "junk: run1 boundary stores the junk sentinel" \
+  "$(cat "$LOGS/.last")" "$(printf 'warp-relay-warp-1\t0000-00-00T00:00:00.000000000\t1')"
+n_ev1="$(awk '{s+=$3} END{print s+0}' "$LOGS/.events")"
+rm -f "$FIX/docker-fail-warp-relay-warp-1"
+printf '2026-10-05T00:00:00Z A error one\n2026-10-05T00:00:01Z B failure two\n' \
+  > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "junk: run2 emits both real lines after a junk boundary" \
+  "$(wc -l < "$LOGS/errors.log")" "3"
+expect_contains "junk: line A emitted" "$LOGS/errors.log" "A error one"
+expect_contains "junk: line B emitted" "$LOGS/errors.log" "B failure two"
+expect_eq "junk: run2 tallies exactly the 2 new lines" \
+  "$(( $(awk '{s+=$3} END{print s+0}' "$LOGS/.events") - n_ev1 ))" "2"
+drop_sandbox
+
+# --- 30. junk heads: a real boundary must not suppress a fresh CLI error --
+# Reverse order: run1 healthy (ts A stored as boundary), then the
+# container disappears. The stderr line keys below the real boundary, so
+# the "<" branch alone would swallow it as old — but its head carries no
+# time, so positional proof of "already seen" does not exist for it.
+# While the outage persists the identical line folds via the ==/count
+# path (one emission per outage); recovery emits the new real line.
+new_sandbox
+printf '2026-10-05T00:00:00Z A error one\n' > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "junkflap: run1 emits the healthy line" \
+  "$(wc -l < "$LOGS/errors.log")" "1"
+printf 'Error: No such container: warp-relay-warp-1\n' > "$FIX/docker-fail-warp-relay-warp-1"
+run_watch 1
+expect_eq "junkflap: run2 records the CLI error despite the real boundary" \
+  "$(grep -cF 'No such container' "$LOGS/errors.log")" "1"
+expect_eq "junkflap: run2 boundary became the junk sentinel" \
+  "$(cat "$LOGS/.last")" "$(printf 'warp-relay-warp-1\t0000-00-00T00:00:00.000000000\t1')"
+run_watch 1
+expect_eq "junkflap: run3 folds the same outage (no re-record)" \
+  "$(grep -cF 'No such container' "$LOGS/errors.log")" "1"
+rm -f "$FIX/docker-fail-warp-relay-warp-1"
+printf '2026-10-05T00:00:01Z B failure two\n' > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "junkflap: run4 emits the recovered real line" \
+  "$(grep -cF 'B failure two' "$LOGS/errors.log")" "1"
+drop_sandbox
+
+# --- 31. corrupt stored boundary key: shape-rejected ----------------------
+# .last is state; a key outside the known shapes (hand-edited, corrupt,
+# or the pre-fix content-derived junk key surviving an in-place upgrade)
+# must be treated as absent: re-emitting duplicates is safe, silently
+# swallowing real lines is not. 99999999999999 is the verified swallow
+# vector — it outranks every real key under plain string order.
+new_sandbox
+printf 'warp-relay-warp-1\t99999999999999\t2\n' > "$LOGS/.last"
+printf '2026-10-05T00:00:00Z A error one\n2026-10-05T00:00:01Z B failure two\n' \
+  > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "corrupt: 99999999999999 does not swallow docker lines" \
+  "$(wc -l < "$LOGS/errors.log")" "2"
+expect_contains "corrupt: line A emitted" "$LOGS/errors.log" "A error one"
+expect_contains "corrupt: line B emitted" "$LOGS/errors.log" "B failure two"
+# legacy shape: the pre-fix code keyed junk heads by content
+# ("Error:.000000000"), which a deployed host can still have on disk.
+printf 'warp-relay-warp-1\tError:.000000000\t1\n' > "$LOGS/.last"
+printf '2026-10-05T00:00:02Z C timeout three\n' > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "corrupt: legacy content-derived junk key rejected too" \
+  "$(grep -cF 'C timeout three' "$LOGS/errors.log")" "1"
+# same rejection through the journal source (14-digit keys).
+rm -f "$FIX/docker-warp-relay-warp-1.log"
+printf 'warp-keep-cold.service\t99999999999999\t2\n' > "$LOGS/.last"
+printf 'Oct 05 00:00:00 host warp-keep-cold[1]: troubled: still failing one\n' > "$FIX/journal.log"
+run_watch 1
+expect_eq "corrupt: journal source rejects the swallow key too" \
+  "$(grep -cF 'still failing one' "$LOGS/errors.log")" "1"
+drop_sandbox
+
+# --- 32. journal junk heads: same sentinel contract ------------------------
+# Journal lines without the journald "MMM DD HH:MM:SS" head (a bare
+# controller line a wrapper captured, etc.) key as the all-zero 14-digit
+# sentinel: below every real key, never suppressed by a real boundary,
+# folding only on an exact repeat while one outage persists.
+new_sandbox
+printf 'keeper #7 still failing hard\n' > "$FIX/journal.log"
+run_watch 1
+expect_eq "jjunk: run1 records the junk-headed line" \
+  "$(grep -cF 'keeper #7 still failing hard' "$LOGS/errors.log")" "1"
+expect_eq "jjunk: run1 boundary is the journal sentinel" \
+  "$(cat "$LOGS/.last")" "$(printf 'warp-keep-cold.service\t00000000000000\t1')"
+j1='Oct 05 00:00:00 host warp-keep-cold[1]: troubled: still failing one'
+j2='Oct 05 00:00:01 host warp-keep-cold[1]: troubled: still failing two'
+printf '%s\n%s\n' "$j1" "$j2" > "$FIX/journal.log"
+run_watch 1
+expect_eq "jjunk: recovery after junk boundary emits both real lines" \
+  "$(wc -l < "$LOGS/errors.log")" "3"
+printf 'keeper #7 still failing hard\n' > "$FIX/journal.log"
+run_watch 1
+expect_eq "jjunk: second outage emits despite the real boundary" \
+  "$(grep -cF 'keeper #7 still failing hard' "$LOGS/errors.log")" "2"
+run_watch 1
+expect_eq "jjunk: same outage folds (no re-record)" \
+  "$(grep -cF 'keeper #7 still failing hard' "$LOGS/errors.log")" "2"
+printf 'Oct 05 00:00:02 host warp-keep-cold[1]: troubled: still failing three\n' > "$FIX/journal.log"
+run_watch 1
+expect_eq "jjunk: recovery after junk boundary emits" \
+  "$(grep -cF 'troubled: still failing three' "$LOGS/errors.log")" "1"
+drop_sandbox
+
 t1="$(date +%s)"
 printf '# %d passed, %d failed (%ds)\n' "$pass" "$fail" "$((t1 - t0))"
 [ "$fail" -eq 0 ]

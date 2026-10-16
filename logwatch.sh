@@ -21,7 +21,8 @@
 # State (all inside $LOG_DIR, survives restarts):
 #   .cursor  epoch seconds of the last scrape start (next --since)
 #   .last    per source "src<TAB>key<TAB>count": normalized timestamp key
-#            of the last fetched line + how many fetched lines shared it
+#            of the last fetched line, or the head's junk sentinel when it
+#            carries no timestamp + how many fetched lines shared it
 #            (the exact --since refetch-overlap skip; see process_source)
 #   .events  "relay class n" tallies for the current UTC day
 #   .day     UTC day (YYYY-MM-DD) the .events tallies belong to
@@ -48,6 +49,16 @@ DAYFILE="$LOG_DIR/.day"
 # digit-guarded so PIDs and ports never match; everything else is a
 # plain substring. g(a|i)ve covers both GIVE UP and GAVE UP.
 MATCH_RE='error|fail|refus|timeout|g(a|i)ve up|troubled|server_error|still failing|unexpected http|proxy error|fetch failed|econnrefused|epipe|(^|[^0-9])(429|500|502|403)([^0-9]|$)'
+
+# Junk-key sentinels: normalized keys for heads that carry no usable
+# timestamp — docker CLI stderr ("Error: No such container: ...") and
+# journal lines without a journald "MMM DD HH:MM:SS" prefix. Each sorts
+# BELOW every real key of its mode ("0" < "2" in docker; an all-zero
+# 14-digit key is the flat minimum for journal), so a stored junk
+# boundary can never swallow real lines. process_source holds the
+# mirror rule for the other direction (see the skip predicate there).
+JUNK_DOCKER='0000-00-00T00:00:00.000000000'
+JUNK_JOURNAL='00000000000000'
 
 mkdir -p "$LOG_DIR"
 TMPDIR_WORK="$(mktemp -d)"
@@ -117,9 +128,21 @@ get_boundary() {
   # Echo "<key> <count>" for source $1 (empty when absent/corrupt).
   # key = normalized timestamp key of the last fetched line, count =
   # how many fetched lines shared that key (the trailing run length).
+  #
+  # The stored key must also match a KNOWN key shape: one of the two
+  # junk sentinels or a year-bounded real key of either mode. Anything
+  # else is corrupt state (hand-edited, truncated, or the pre-fix
+  # content-derived junk key surviving an in-place upgrade) and is
+  # treated as absent — the skip then re-emits instead of swallowing;
+  # when loss and duplication conflict, duplication is the safe side.
+  # (Repeated [0-9] classes, not {9}/{10} intervals: pre-2020 mawk and
+  # traditional awk lack ERE intervals.)
   [ -f "$LAST" ] || return 0
-  awk -F'\t' -v s="$1" '
-    $1 == s && $2 != "" && $3 ~ /^[0-9]+$/ {
+  awk -F'\t' -v s="$1" -v jd="$JUNK_DOCKER" -v jj="$JUNK_JOURNAL" '
+    $1 == s && $3 ~ /^[0-9]+$/ &&
+    ($2 == jd || $2 == jj ||
+     $2 ~ /^(20|21)[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]$/ ||
+     $2 ~ /^(20|21)[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]$/) {
       printf "%s %d\n", $2, $3 + 0
       exit
     }' "$LAST"
@@ -175,6 +198,16 @@ process_source() {
   # stream (skipped lines included) so the skip chains correctly across
   # any number of runs. NOTE: ps_-prefixed vars — emit_group shares
   # global scope and must not clobber these.
+  #
+  # Timestamp-less heads (docker CLI stderr, journal lines without the
+  # journald prefix) normalize to the mode's junk sentinel, which sorts
+  # below every real key. Two consequences: a stored junk boundary can
+  # never swallow real lines, and the skip predicate below never calls
+  # junk "old" via the < branch when a real boundary is stored — only
+  # the ==/count path folds junk, i.e. one emission per outage (CLI
+  # stderr reappears on every run while a container is missing, so it
+  # must be foldable, yet a first occurrence must survive a healthy
+  # run's boundary).
   ps_src="$1"; ps_file="$2"; ps_mode="$3"
   [ -s "$ps_file" ] || return 0
   ps_b="$(get_boundary "$ps_src")"
@@ -190,7 +223,8 @@ process_source() {
       docker)
         # RFC3339(Nano) first field -> YYYY-MM-DDTHH:MM:SS.fffffffff
         # (fraction zero-padded to 9 digits so plain string order is
-        # time order). Anything unparseable still yields a stable key.
+        # time order). Anything unparseable folds to the junk sentinel
+        # (stable, and below every real key — see the case below).
         ps_ts="${ps_line%% *}"
         ps_ts="${ps_ts%Z}"
         case "$ps_ts" in
@@ -200,14 +234,25 @@ process_source() {
         case "$ps_frac" in *[!0-9]*) ps_frac="";; esac
         while [ "${#ps_frac}" -lt 9 ]; do ps_frac="${ps_frac}0"; done
         while [ "${#ps_frac}" -gt 9 ]; do ps_frac="${ps_frac%?}"; done
-        ps_lk="$ps_core.$ps_frac"
+        # Heads that are not the RFC3339 shape (docker CLI stderr) fold
+        # to the junk sentinel instead of leaking content into the key:
+        # a content-derived key like "Error:.000000000" sorts ABOVE real
+        # timestamps and the skip predicate would silently mark real
+        # lines old (lost forever). The sentinel sorts below them.
+        case "$ps_core" in
+          [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9])
+            ps_lk="$ps_core.$ps_frac";;
+          *) ps_lk="$JUNK_DOCKER";;
+        esac
         ;;
       journal)
         # "MMM DD HH:MM:SS" -> YYYYMMDDHHMMSS. Month name maps to digits
         # and the year is inferred from now, nudged +/-1 across a New
         # Year boundary (a Dec entry in a January run is last year's,
-        # and vice versa). Unparseable heads collapse to 00s; all
-        # occurrences of the same line then still share one key.
+        # and vice versa). Heads that do not parse fold to the junk
+        # sentinel: a year-prefixed pseudo-key ("20260000000000") would
+        # outrank and swallow December's real keys in a January run
+        # (and November/December's in the mirror case).
         ps_mon="${ps_line%"${ps_line#???}"}"
         ps_rest="${ps_line#??? }"
         ps_rest="${ps_rest#"${ps_rest%%[! ]*}"}"
@@ -217,10 +262,10 @@ process_source() {
           Jan) ps_mn=01;; Feb) ps_mn=02;; Mar) ps_mn=03;; Apr) ps_mn=04;;
           May) ps_mn=05;; Jun) ps_mn=06;; Jul) ps_mn=07;; Aug) ps_mn=08;;
           Sep) ps_mn=09;; Oct) ps_mn=10;; Nov) ps_mn=11;; Dec) ps_mn=12;;
-          *) ps_mn=00;;
+          *) ps_mn="";;
         esac
         case "$ps_day" in
-          ''|*[!0-9]*) ps_day=00;;
+          ''|*[!0-9]*) ps_day="";;
           *)
             # string-only zero handling: $((08)) is invalid POSIX octal.
             ps_day="${ps_day#0}"
@@ -235,14 +280,18 @@ process_source() {
             ps_h="${ps_hms%%:*}"; ps_hm="${ps_hms#*:}"
             ps_m="${ps_hm%%:*}"; ps_s="${ps_hm#*:}"
             ps_hms="$ps_h$ps_m$ps_s";;
-          *) ps_hms="000000";;
+          *) ps_hms="";;
         esac
-        ps_year="$RUN_YEAR"
-        case "$RUN_MON$ps_mn" in
-          0112) ps_year=$((ps_year - 1));;
-          1201) ps_year=$((ps_year + 1));;
-        esac
-        ps_lk="$ps_year$ps_mn$ps_day$ps_hms"
+        if [ -z "$ps_mn" ] || [ -z "$ps_day" ] || [ -z "$ps_hms" ]; then
+          ps_lk="$JUNK_JOURNAL"
+        else
+          ps_year="$RUN_YEAR"
+          case "$RUN_MON$ps_mn" in
+            0112) ps_year=$((ps_year - 1));;
+            1201) ps_year=$((ps_year + 1));;
+          esac
+          ps_lk="$ps_year$ps_mn$ps_day$ps_hms"
+        fi
         ;;
       *)
         ps_lk="${ps_line%% *}"
@@ -259,6 +308,19 @@ process_source() {
       ps_old=no
       if [ "$ps_lk" \< "$ps_pkey" ]; then
         ps_old=yes
+        # A junk key sorts below every real key by construction, so the
+        # < branch alone would silently drop a first-occurrence
+        # timestamp-less line (docker CLI stderr) whenever a healthy
+        # run's real boundary is stored — exactly the disappearance the
+        # log must record. Junk heads carry no time, so no positional
+        # "already seen" proof exists for them: only the ==/count path
+        # below may fold junk (repeats within one outage); a first
+        # occurrence is always new. ERE alternation is unavailable in
+        # case patterns, hence the mode switch.
+        case "$ps_mode" in
+          docker) [ "$ps_lk" = "$JUNK_DOCKER" ] && ps_old=no;;
+          journal) [ "$ps_lk" = "$JUNK_JOURNAL" ] && ps_old=no;;
+        esac
       elif [ "$ps_lk" = "$ps_pkey" ] && [ "$ps_oldn" -lt "$ps_pcnt" ]; then
         ps_oldn=$((ps_oldn + 1))
         ps_old=yes
