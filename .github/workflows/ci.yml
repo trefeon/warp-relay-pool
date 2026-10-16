@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: JS syntax check
+        run: |
+          node --check server.mjs
+          node --check keep-cold.mjs
+
+      # On this runner /bin/sh is dash, so `sh -n` doubles as the POSIX gate.
+      - name: Shell syntax check (dash via sh, plus bash for the test suite)
+        run: |
+          for f in generate-compose.sh setup.sh get-status.sh logwatch.sh \
+                   logwatch.test.sh warp-lite/entrypoint.sh; do
+            echo "sh -n $f"
+            sh -n "$f"
+          done
+          bash -n logwatch.test.sh
+
+      - name: Compose generation is deterministic
+        run: |
+          sh ./generate-compose.sh 10
+          git diff --exit-code docker-compose.yml
+
+      - name: Install relay deps
+        run: npm install --no-audit --no-fund
+
+      - name: Logwatch test suite
+        run: bash logwatch.test.sh
+
+      - name: Relay guard integration tests
+        run: |
+          if ls test/*.test.mjs >/dev/null 2>&1; then
+            node --test test/
+          else
+            echo "no relay tests yet"
+          fi
