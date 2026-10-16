@@ -154,9 +154,22 @@ expect_eq "daemon down: nothing recorded" "$(wc -c < "$LOGS/errors.log")" "0"
 drop_sandbox
 
 # --- 6. no docker/journalctl binaries at all ------------------------------
+# CI runners ship a real docker binary, so absence must be constructed rather
+# than assumed: build a PATH-only mirror of the tool directories with the
+# names under test removed. Keeping /usr/bin on PATH would let the real
+# docker resolve again (its "No such container" error is recorded by design,
+# see case 4).
 new_sandbox
 mkdir -p "$T/emptybin"
-PATH="$T/emptybin:/usr/bin:/bin" POOL_DIR="$REPO" LOG_DIR="$LOGS" COUNT=1 \
+for dir in /usr/bin /bin /usr/local/bin /usr/sbin /sbin; do
+  [ -d "$dir" ] || continue
+  for f in "$dir"/*; do
+    b="$(basename "$f")"
+    case "$b" in docker|dockerd|docker-compose|journalctl) continue ;; esac
+    [ -e "$T/emptybin/$b" ] || ln -s "$f" "$T/emptybin/$b" 2>/dev/null || true
+  done
+done
+PATH="$T/emptybin" POOL_DIR="$REPO" LOG_DIR="$LOGS" COUNT=1 \
 sh "$WATCH" > "$T/out.txt" 2>&1
 expect_eq "missing binaries: exit 0" "$?" "0"
 expect_eq "missing binaries: errors.log empty" "$(wc -c < "$LOGS/errors.log")" "0"
