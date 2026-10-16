@@ -3,9 +3,11 @@
 # Uses MicroWARP (~1.8 MiB RAM/node) and TryCloudflare Quick Tunnels for instant setup.
 set -eu
 
-# Load .env when present (same contract as generate-compose.sh: process env
-# wins, KEY=VALUE only, CRLF-safe, no value ever evaluated). The wizard
-# writes the final COUNT and BASE_PORT into the installed unit below, so
+# Load .env when present (same loader as generate-compose.sh: process env
+# wins, KEY=VALUE only, CRLF-safe, no value ever evaluated — EXCEPT that
+# COUNT/RELAY_COUNT are excluded below: the wizard's VPS sizing owns the
+# pool size, while the generator honors .env COUNT for manual runs). The
+# wizard writes the final COUNT and BASE_PORT into the installed unit, so
 # these values are the single source for the compose file AND the prober.
 if [ -f .env ]; then
   cr="$(printf '\r')"
@@ -306,6 +308,22 @@ else
       INGRESS_CHOICE="tunnels"
     fi
   fi
+fi
+
+# Interactive input can exceed the safe maximum (the clamp above only covers
+# env/-y paths); re-validate the resolved count before anything uses it.
+case "$COUNT" in
+  ''|*[!0-9]*)
+    log_warn "COUNT='${COUNT}' is not a number; using the recommended ${REC_COUNT}."
+    COUNT="$REC_COUNT"
+    ;;
+esac
+if [ "$COUNT" -gt "$MAX_RELAYS" ]; then
+  log_warn "COUNT=${COUNT} exceeds the safe maximum for this VPS (${MAX_RELAYS}); using ${MAX_RELAYS}."
+  COUNT="$MAX_RELAYS"
+fi
+if [ "$COUNT" -lt 1 ]; then
+  COUNT=1
 fi
 
 WITH_TUNNELS_FLAG=""
