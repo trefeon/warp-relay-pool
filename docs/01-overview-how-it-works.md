@@ -65,7 +65,7 @@ Running `./generate-compose.sh N --with-tunnels` pairs each relay port (`300N`) 
 
 ### 2. Mesh-VPN Direct (Tailscale)
 
-Maps host ports `3101`– to container ports `3001`– (`ports: "3101-<3100+N>:3001-<3000+N>"` on `relay`), so `http://<tailscale-ip>:310N` reaches relay `:300N` over your private encrypted Tailscale network.
+The `relay` service publishes `${INGRESS_BIND}:3101-<3100+N>` → container `3001-<3000+N>`, so `http://<tailscale-ip>:310N` reaches relay `:300N` over your private encrypted Tailscale network. `INGRESS_BIND` defaults to `127.0.0.1`; the wizard (`setup.sh`) sets it to the VPS Tailscale IP for mesh installs, and manual installs pass it explicitly (`INGRESS_BIND=<tailscale-ip> ./generate-compose.sh N`).
 - **Static:** URLs never change across container recreations, host reboots, or updates.
 - **Private:** No traffic passes over public tunnel endpoints.
 ## Why one port per relay (not a single load balancer)

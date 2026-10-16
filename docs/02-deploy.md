@@ -56,7 +56,11 @@ docker compose up -d --build
 
 Topology is fixed by the generator: bridge `10.244.0.0/16`, relay app at
 `10.244.0.100`, `tunnel-N → http://10.244.0.100:300N` (tunnels mode only),
-`warp-N` on `:1080` (raw proxy on host `<10800+N>`).
+`warp-N` on `:1080` (raw proxy on host `<10800+N>`; loopback by default).
+Host binds default to loopback; override with `WARP_BIND=<addr>` (SOCKS
+family) and `INGRESS_BIND=<addr>` (relay router, mesh mode only — tunnels
+mode does not host-publish the router at all). The wizard sets
+`INGRESS_BIND` to the VPS Tailscale IP automatically.
 `WARP_HOST_N` / `WARP_PORT_N` env overrides exist in `server.mjs` but the
 default naming needs no configuration.
 

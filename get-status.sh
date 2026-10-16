@@ -2,12 +2,13 @@
 # Print each relay's port, live egress IP, and tunnel URL (when tunnels
 # exist), then the ready-to-paste client commands.
 #
-# Primary path is mesh-VPN direct ingress: host port 310N forwards to the
-# relay app's container port 300N, so the client lines use
-# http://<tailscale-ip>:310N. The mesh address is read from
-# `tailscale ip -4` when available, else printed as the <tailscale-ip>
-# placeholder. Quick-Tunnel `/freeflow add` lines print ONLY when tunnel
-# containers exist (graceful when absent).
+# Mesh direct ingress: host port 310N forwards to the relay app's container
+# port 300N. The client lines use the router's actual host bind, parsed from
+# the generated docker-compose.yml (the wizard sets INGRESS_BIND to the VPS
+# Tailscale IP for mesh installs; the safe default bind is 127.0.0.1, which
+# is not reachable from the tailnet and is reported as such). Quick-Tunnel
+# `/freeflow add` lines print ONLY when tunnel containers exist (graceful
+# when absent).
 #
 # Usage: ./get-status.sh [count]     (default COUNT env, else 10)
 # Missing/stopped containers print "(starting...)" / "(not ready)" and
@@ -90,13 +91,31 @@ while [ "$i" -le "$COUNT" ]; do
   i=$((i + 1))
 done
 
-if [ "$FOUND_TUNNELS" -eq 0 ] || [ -n "$(mesh_ip)" ]; then
+# Mesh client lines must reflect the router's actual host bind: the generated
+# compose publishes "<bind>:3101-...", and loopback (the safe default) is not
+# reachable from the tailnet. The wizard sets INGRESS_BIND to the Tailscale IP
+# for mesh installs; tunnels-mode files carry no relay ports at all.
+ROUTER_BIND="$(sed -n 's/^ *- "\([^":]*\):3101-.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+
+if [ "$FOUND_TUNNELS" -eq 0 ]; then
   echo ""
-  echo "=== Mesh-VPN direct commands (Tailscale private) ==="
-  i=1
-  while [ "$i" -le "$COUNT" ]; do
-    TS_PORT=$((3100 + i))
-    echo "/freeflow add http://${TS_IP}:${TS_PORT} relay-${i}"
-    i=$((i + 1))
-  done
+  if [ -z "$ROUTER_BIND" ]; then
+    echo "=== Mesh-VPN direct: relay router not host-published ==="
+    echo "(generate a mesh-mode file: INGRESS_BIND=<tailscale-ip> ./generate-compose.sh ${COUNT})"
+  elif [ "$ROUTER_BIND" = "127.0.0.1" ]; then
+    echo "=== Mesh-VPN direct: router bound to 127.0.0.1 (not reachable from the tailnet) ==="
+    echo "(re-run: INGRESS_BIND=${TS_IP} ./generate-compose.sh ${COUNT} && docker compose up -d)"
+  else
+    echo "=== Mesh-VPN direct commands (Tailscale private) ==="
+    i=1
+    while [ "$i" -le "$COUNT" ]; do
+      TS_PORT=$((3100 + i))
+      echo "/freeflow add http://${ROUTER_BIND}:${TS_PORT} relay-${i}"
+      i=$((i + 1))
+    done
+  fi
+else
+  echo ""
+  echo "=== Mesh-VPN direct: not published in tunnels mode ==="
+  echo "(mesh ingress needs a mesh-mode deployment: ./generate-compose.sh ${COUNT})"
 fi

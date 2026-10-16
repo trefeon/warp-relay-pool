@@ -275,6 +275,14 @@ if [ "$INGRESS_CHOICE" = "tunnels" ] || [ "$INGRESS_CHOICE" = "1" ]; then
   log_info "Selected: TryCloudflare Quick Tunnels (${COUNT} relays)."
 else
   log_info "Selected: Tailscale Mesh-VPN direct (${COUNT} relays)."
+  if [ -n "$TS_IP" ]; then
+    INGRESS_BIND="$TS_IP"
+    export INGRESS_BIND
+    log_info "Relay router will be published on ${TS_IP} only (Tailscale interface)."
+  else
+    log_warn "Tailscale IP not detected; relay router will stay on 127.0.0.1."
+    log_warn "Authenticate Tailscale, then re-run: INGRESS_BIND=<tailscale-ip> sh ./generate-compose.sh ${COUNT}"
+  fi
 fi
 
 # -------------------------------------------------------------

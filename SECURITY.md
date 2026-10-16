@@ -21,13 +21,23 @@ current egress IP from the built-in health check (a request without
 `x-relay-target` returns the Cloudflare trace for that egress). Treat relay
 URLs as sensitive even though Tunnel URLs are public by construction.
 
-**Host-published ports.** `docker-compose.yml` publishes two port families:
+**Host-published ports.** Both port families bind to `127.0.0.1` by
+default: nothing is reachable from the internet unless you opt in.
 
 - `10800+N` → raw WARP SOCKS5 proxy. No allowlist — a plain egress proxy.
-  Bind or firewall these to loopback, your Tailscale interface, or a
-  trusted network; never leave them reachable from the internet.
-- `3100+N` → relay router (mesh-VPN ingress). Restrict to your mesh/VPN
-  or firewall likewise.
+  Expose deliberately with `WARP_BIND=0.0.0.0` (or an interface address)
+  at generation time; when exposed, keep it on loopback, your Tailscale
+  interface, or a trusted network — never the open internet.
+- `3100+N` → relay router (mesh-VPN ingress), published only in mesh mode;
+  `setup.sh` sets `INGRESS_BIND` to the VPS Tailscale IP. In tunnels mode
+  it is not host-published at all — tunnels reach it in-network at
+  `http://10.244.0.100:300N`.
+- Overrides: `WARP_BIND=<addr> ./generate-compose.sh N` and
+  `INGRESS_BIND=<addr> ./generate-compose.sh N` (default `127.0.0.1`).
+
+Docker publishes ports via DNAT before host `INPUT` rules are evaluated, so
+a plain `ufw`/`firewalld` setup does not filter these mappings; use
+`DOCKER-USER` rules if you deliberately expose anything.
 
 ## Repository privacy rules
 
