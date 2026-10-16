@@ -478,11 +478,15 @@ install_policy_routes() {
     # Pin the endpoint FIRST: handshake/keepalive must not loop into wg0.
     pin_wg_endpoint_route
 
-    # Move the main-table default(s) onto the tunnel.
+    # Move the main-table default(s) onto the tunnel. Fail closed: without the
+    # v4 default on wg0 the container keeps egressing from its host IP while
+    # SOCKS stays up, and every upstream probe then looks healthy — the exact
+    # silence mode this relay must never ship (the pilot-V1 route bug class).
+    # restart: always re-runs the whole handshake path instead of serving.
     if ip route replace default dev "$WG_IFACE" 2>/dev/null; then
         log "main-table default now dev ${WG_IFACE} (tunnel egress)"
     else
-        warn "main-table default-via-tunnel install failed"
+        die "main-table default-via-tunnel install failed; refusing to serve SOCKS without tunnel egress"
     fi
     if is_truthy "$ENABLE_IPV6" && iface_has_global_ipv6 "$WG_IFACE"; then
         if ip -6 route replace ::/0 dev "$WG_IFACE" 2>/dev/null; then
@@ -508,7 +512,8 @@ show_egress_ip() {
         https://1.1.1.1/cdn-cgi/trace 2>/dev/null || true)"; then
         ip_line="$(printf '%s\n' "$out" | grep '^ip=' || true)"
         if [ -n "$ip_line" ]; then
-            log "  IPv4 ${ip_line}"
+            warp_line="$(printf '%s\n' "$out" | grep '^warp=' || true)"
+            log "  IPv4 ${ip_line}${warp_line:+ }${warp_line}"
             v4_ok=1
         fi
     fi
@@ -538,7 +543,8 @@ show_egress_ip() {
             https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"; then
             ip_line="$(printf '%s\n' "$out" | grep '^ip=' || true)"
             if [ -n "$ip_line" ]; then
-                log "  IPv6 ${ip_line}"
+                warp_line="$(printf '%s\n' "$out" | grep '^warp=' || true)"
+                log "  IPv6 ${ip_line}${warp_line:+ }${warp_line}"
                 v6_ok=1
             fi
         fi
