@@ -47,6 +47,15 @@ CONT_HI=$((3000 + COUNT))
 # only deliberate exposure needs WARP_BIND / INGRESS_BIND.
 SOCKS_BIND="${WARP_BIND:-127.0.0.1}"
 ROUTER_BIND="${INGRESS_BIND:-127.0.0.1}"
+# IPv6 binds would need Compose's bracketed port syntax ("[::]:port:port"),
+# which the templates below do not emit — reject rather than write a file
+# Docker cannot parse.
+case "$SOCKS_BIND$ROUTER_BIND" in
+  *:*)
+    echo "error: WARP_BIND/INGRESS_BIND must be IPv4 or 0.0.0.0 (IPv6 binds are not supported); got WARP_BIND='$SOCKS_BIND' INGRESS_BIND='$ROUTER_BIND'" >&2
+    exit 1
+    ;;
+esac
 if [ "$WITH_TUNNELS" = true ]; then
 ROUTER_LINE="relay router not host-published; tunnels reach it in-network at http://10.244.0.100:300N"
 else

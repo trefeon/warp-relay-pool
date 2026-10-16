@@ -53,6 +53,11 @@
  *   RELAY_HOST          relay app bridge address      (default 10.244.0.100)
  *   BASE_PORT           first relay port              (default 3000)
  *   COUNT               number of relays              (default 10)
+ *   SOCKS_HOST          host dialed for the SOCKS readiness/egress probes
+ *                       (default 127.0.0.1; set this to the WARP_BIND address
+ *                       when the SOCKS family is bound to an
+ *                       interface-specific address, since loopback then has
+ *                       no listener. 0.0.0.0 binds still answer on loopback)
  *   PROBE_MODELS        comma-separated models to probe (default
  *                       nemotron-3.5-lightning-free,mimo-v2.5-free,
  *                       muse-spark-1.3-contributor-free — two chat families
@@ -98,6 +103,7 @@ import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 
 const RELAY_HOST = process.env.RELAY_HOST ?? "10.244.0.100";
+const SOCKS_HOST = process.env.SOCKS_HOST ?? "127.0.0.1";
 const BASE_PORT = Number(process.env.BASE_PORT ?? 3000);
 const COUNT = Number(process.env.COUNT ?? 10);
 const PROBE_MODELS = (process.env.PROBE_MODELS
@@ -249,7 +255,7 @@ function warpReady(index) {
  try {
   // MicroWARP has no warp-cli and no guaranteed curl — check from the deploy
   // host via SOCKS instead of docker-exec.
-  const trace = execFileSync("curl", ["-s", "-m", "10", "-x", `socks5h://127.0.0.1:${10800 + index}`, "https://cloudflare.com/cdn-cgi/trace"], { encoding: "utf8", timeout: 15_000 });
+  const trace = execFileSync("curl", ["-s", "-m", "10", "-x", `socks5h://${SOCKS_HOST}:${10800 + index}`, "https://cloudflare.com/cdn-cgi/trace"], { encoding: "utf8", timeout: 15_000 });
   return /^ip=/m.test(trace) && /warp=on/m.test(trace);
  } catch {
   return false;
@@ -260,7 +266,7 @@ function warpReady(index) {
 function egressIp(index) {
  try {
   // MicroWARP has no docker-exec curl — probe from the deploy host via SOCKS.
-  const trace = execFileSync("curl", ["-s", "-m", "10", "-x", `socks5h://127.0.0.1:${10800 + index}`, "https://cloudflare.com/cdn-cgi/trace"], { encoding: "utf8", timeout: 15_000 });
+  const trace = execFileSync("curl", ["-s", "-m", "10", "-x", `socks5h://${SOCKS_HOST}:${10800 + index}`, "https://cloudflare.com/cdn-cgi/trace"], { encoding: "utf8", timeout: 15_000 });
   return (trace.match(/^ip=(.+)$/m)?.[1] ?? "?").trim();
  } catch {
   return "?";

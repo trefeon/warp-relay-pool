@@ -34,6 +34,11 @@ default: nothing is reachable from the internet unless you opt in.
   `http://10.244.0.100:300N`.
 - Overrides: `WARP_BIND=<addr> ./generate-compose.sh N` and
   `INGRESS_BIND=<addr> ./generate-compose.sh N` (default `127.0.0.1`).
+  Binds are IPv4 only (an IPv6 value is rejected at generation time).
+- Interface-specific SOCKS binds (`WARP_BIND=10.0.0.5`) have no loopback
+  listener: set `SOCKS_HOST=<that address>` for keep-cold's probes
+  (`get-status.sh` reads the bind from the compose file automatically).
+  `0.0.0.0` keeps loopback working and needs no change.
 
 Docker publishes ports via DNAT before host `INPUT` rules are evaluated, so
 a plain `ufw`/`firewalld` setup does not filter these mappings; use

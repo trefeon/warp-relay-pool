@@ -60,7 +60,10 @@ Topology is fixed by the generator: bridge `10.244.0.0/16`, relay app at
 Host binds default to loopback; override with `WARP_BIND=<addr>` (SOCKS
 family) and `INGRESS_BIND=<addr>` (relay router, mesh mode only — tunnels
 mode does not host-publish the router at all). The wizard sets
-`INGRESS_BIND` to the VPS Tailscale IP automatically.
+`INGRESS_BIND` to the VPS Tailscale IP automatically. Binds are IPv4 only;
+an interface-specific `WARP_BIND` (not `127.0.0.1`/`0.0.0.0`) needs
+`SOCKS_HOST=<addr>` for keep-cold's probes (`get-status.sh` reads the bind
+from the compose file itself).
 `WARP_HOST_N` / `WARP_PORT_N` env overrides exist in `server.mjs` but the
 default naming needs no configuration.
 
