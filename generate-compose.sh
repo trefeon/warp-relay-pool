@@ -19,6 +19,8 @@ set -eu
 # editing .env alone changes nothing until this script runs again.
 if [ -f .env ]; then
   cr="$(printf '\r')"
+  dq='"' # quote characters, so the case patterns need no escapes
+  sq="'"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     # A value-less line is not a KEY=VALUE assignment — skip it instead of
@@ -33,11 +35,12 @@ if [ -f .env ]; then
     # parameters or die under `set -u` despite the skip contract.
     case "$key" in ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;; esac
     case "$val" in
-      \"*\") val="${val#\"}"; val="${val%\"}" ;;
-      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+      "$dq"*) val="${val#"$dq"}"; val="${val%%"$dq"*}" ;;
+      "$sq"*) val="${val#"$sq"}"; val="${val%%"$sq"*}" ;;
       # Bare values follow compose's env-file behaviour: a whitespace-preceded
-      # `#…` starts an inline comment and is stripped. A quoted value keeps
-      # its bytes (a ` #` inside quotes is part of the value).
+      # `#…` starts an inline comment and is stripped. Quoted values run up to
+      # the closing quote, with any trailing comment ignored; a ` #` inside the
+      # quotes is part of the value.
       *) val="${val%%[[:space:]]#*}" ;;
     esac
     # shellcheck disable=SC2163,SC2086 # key is validated above

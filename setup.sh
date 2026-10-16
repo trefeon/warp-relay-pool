@@ -11,6 +11,8 @@ set -eu
 # these values are the single source for the compose file AND the prober.
 if [ -f .env ]; then
   cr="$(printf '\r')"
+  dq='"' # quote characters, so the case patterns need no escapes
+  sq="'"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     case "$line" in *=*) ;; *) continue ;; esac
@@ -25,10 +27,11 @@ if [ -f .env ]; then
     # generate-compose.sh bakes them and the unit must match.
     case "$key" in COUNT|RELAY_COUNT) continue ;; esac
     case "$val" in
-      \"*\") val="${val#\"}"; val="${val%\"}" ;;
-      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+      "$dq"*) val="${val#"$dq"}"; val="${val%%"$dq"*}" ;;
+      "$sq"*) val="${val#"$sq"}"; val="${val%%"$sq"*}" ;;
       # Bare values follow compose's env-file behaviour: a whitespace-preceded
-      # `#…` starts an inline comment and is stripped.
+      # `#…` starts an inline comment and is stripped; quoted values end at
+      # the closing quote with any trailing comment ignored.
       *) val="${val%%[[:space:]]#*}" ;;
     esac
     # shellcheck disable=SC2163,SC2086 # key is validated above
