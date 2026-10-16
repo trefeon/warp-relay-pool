@@ -35,10 +35,12 @@ INTERVAL_S=600 node keep-cold.mjs --loop   # pass every 10 min, foreground
 | `RELAY_HOST` | `10.244.0.100` | Relay app bridge address probed directly (not via tunnels) |
 | `BASE_PORT` | `3000` | Relay N probed at `BASE_PORT+N` |
 | `COUNT` | `10` | Relays probed |
-| `PROBE_MODELS` | `nemotron-3.5-lightning-free,mimo-v2.5-free,muse-spark-1.3-contributor-free` | One probe each per relay (`PROBE_MODEL` = legacy single override) |
-| `RESPONSES_MODELS` | `muse-spark-1.2-contributor-free,muse-spark-1.3-contributor-free` | Probed via `/zen/v1/responses`; rest via `/zen/v1/chat/completions` |
+| `PROBE_TARGET` | `https://api.kilo.ai` | Upstream the probes go through (Zen's free tier refuses non-OpenCode clients since 2026-10-14) |
+| `PROBE_CHAT_PATH` / `PROBE_RESPONSES_PATH` | `/api/gateway/chat/completions` / `/api/gateway/responses` | Wire paths under `PROBE_TARGET` |
+| `PROBE_MODELS` | `nvidia/nemotron-3.5-lightning:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free` | One probe each per relay (`PROBE_MODEL` = legacy single override) |
+| `RESPONSES_MODELS` | `dots-studio/dots-3-note-preview:free` | Probed via `PROBE_RESPONSES_PATH`; rest via `PROBE_CHAT_PATH` |
 | `GLOBAL_QUOTA_GUARD` | `max(8, COUNT - 1)` (= 9 at `COUNT=10`) | 429-on-this-many-relays = upstream quota, skip rotation (capped at `COUNT`; override via env, see `.env.example`) |
-| `SPEED_MODEL` / `SLOW_THRESHOLD_MS` / `SLOW_MAX_ROTATIONS` | `muse-spark-1.3-contributor-free` / `0` / `2` | Speed rotation, disabled by default |
+| `SPEED_MODEL` / `SLOW_THRESHOLD_MS` / `SLOW_MAX_ROTATIONS` | `nvidia/nemotron-3.5-lightning:free` / `0` / `2` | Speed rotation, disabled by default |
 | `MAX_ROTATIONS` | `4` | Restarts per 429-relay per pass |
 | `ROTATE_CONCURRENCY` | `3` | Parallel restarts |
 | `CONTAINER_PREFIX` | `warp-relay-warp-` | `docker restart ${PREFIX}N` target |

@@ -58,17 +58,27 @@
  *                       when the SOCKS family is bound to an
  *                       interface-specific address, since loopback then has
  *                       no listener. 0.0.0.0 binds still answer on loopback)
+ *   PROBE_TARGET        upstream the probes go through (default
+ *                       https://api.kilo.ai — the lane clients actually
+ *                       use; OpenCode's Zen free tier has refused every
+ *                       non-OpenCode client with 403 FreeTierError since
+ *                       2026-10-14, fingerprints included)
+ *   PROBE_CHAT_PATH     chat wire path under PROBE_TARGET (default
+ *                       /api/gateway/chat/completions)
+ *   PROBE_RESPONSES_PATH  responses wire path under PROBE_TARGET (default
+ *                       /api/gateway/responses)
  *   PROBE_MODELS        comma-separated models to probe (default
- *                       nemotron-3.5-lightning-free,mimo-v2.5-free,
- *                       muse-spark-1.3-contributor-free — two chat families
- *                       plus one responses model so per-model throttles on
- *                       either wire path are caught)
+ *                       nvidia/nemotron-3.5-lightning:free,
+ *                       cohere/north-mini-code:free,
+ *                       dots-studio/dots-3-note-preview:free — three
+ *                       families so per-model throttles stay
+ *                       distinguishable)
  *   PROBE_MODEL         legacy single-model override (used only when
  *                       PROBE_MODELS is unset)
- *   RESPONSES_MODELS    comma-separated models served via /zen/v1/responses
- *                       (default muse-spark-1.2-contributor-free,
- *                       muse-spark-1.3-contributor-free; everything else
- *                       probes via /zen/v1/chat/completions)
+ *   RESPONSES_MODELS    comma-separated models probed via
+ *                       PROBE_RESPONSES_PATH (default
+ *                       dots-studio/dots-3-note-preview:free; everything
+ *                       else probes via PROBE_CHAT_PATH)
  *   GLOBAL_QUOTA_GUARD  relays-429ed threshold at which a model counts as
  *                       upstream quota, not egress throttle (default 5;
  *                       capped at COUNT). Quota-capped models are skipped
@@ -80,8 +90,8 @@
  *                       counts as upstream incident, not egress fault
  *                       (default 9, capped at COUNT)
  *   SPEED_MODEL         model whose latency decides slow rotation (default
- *                       muse-spark-1.3-contributor-free — the main daily
- *                       driver; must be in PROBE_MODELS to have timings)
+ *                       nvidia/nemotron-3.5-lightning:free; must be in
+ *                       PROBE_MODELS to have timings)
  *   SLOW_THRESHOLD_MS   200-response slower than this is rotated for speed
  *                       (default 0 = DISABLED — single-sample rank proven
  *                       upstream noise 2026-10-02; re-enable only on
@@ -106,21 +116,24 @@ const RELAY_HOST = process.env.RELAY_HOST ?? "10.244.0.100";
 const SOCKS_HOST = process.env.SOCKS_HOST ?? "127.0.0.1";
 const BASE_PORT = Number(process.env.BASE_PORT ?? 3000);
 const COUNT = Number(process.env.COUNT ?? 10);
+const PROBE_TARGET = process.env.PROBE_TARGET ?? "https://api.kilo.ai";
+const PROBE_CHAT_PATH = process.env.PROBE_CHAT_PATH ?? "/api/gateway/chat/completions";
+const PROBE_RESPONSES_PATH = process.env.PROBE_RESPONSES_PATH ?? "/api/gateway/responses";
 const PROBE_MODELS = (process.env.PROBE_MODELS
  ?? process.env.PROBE_MODEL
- ?? "nemotron-3.5-lightning-free,mimo-v2.5-free,muse-spark-1.3-contributor-free")
+ ?? "nvidia/nemotron-3.5-lightning:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free")
  .split(",")
  .map((s) => s.trim())
  .filter(Boolean);
 const RESPONSES_MODELS = new Set(
  (process.env.RESPONSES_MODELS
-  ?? "muse-spark-1.2-contributor-free,muse-spark-1.3-contributor-free")
+  ?? "dots-studio/dots-3-note-preview:free")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean),
 );
 const GLOBAL_QUOTA_GUARD = Math.min(Number(process.env.GLOBAL_QUOTA_GUARD ?? Math.max(8, COUNT - 1)), COUNT);
-const SPEED_MODEL = process.env.SPEED_MODEL ?? "muse-spark-1.3-contributor-free";
+const SPEED_MODEL = process.env.SPEED_MODEL ?? "nvidia/nemotron-3.5-lightning:free";
 const SLOW_THRESHOLD_MS = Number(process.env.SLOW_THRESHOLD_MS ?? 0);
 const SLOW_MAX_ROTATIONS = Number(process.env.SLOW_MAX_ROTATIONS ?? 2);
 const CONTAINER_PREFIX = process.env.CONTAINER_PREFIX ?? "warp-relay-warp-";
@@ -135,9 +148,13 @@ const INTERVAL_S = Number(process.env.INTERVAL_S ?? 300);
 const LOOP = process.argv.includes("--loop");
 
 // ── Upstream fingerprint ────────────────────────────────────────────
-// The free tier rejects requests that do not look like the official client, so
-// the probe must carry the same headers and tool declarations the proxy sends.
-// A rejected probe (403) would hide the 429 we are actually looking for.
+// Historically OpenCode's free tier rejected requests that did not look like
+// the official client, so the probe carried the same headers and tool
+// declarations the proxy sends — a 403 would have hidden the 429 we are
+// looking for. Since 2026-10-14 that tier refuses every non-OpenCode client
+// regardless of shape (403 FreeTierError), so the defaults target the Kilo
+// lane, where these headers are ignored but harmless; the fingerprint is
+// kept for pools still pointed at opencode.ai via PROBE_TARGET.
 const OPENCODE_CLIENT = "cli";
 const OPENCODE_PROJECT = createHash("sha1")
  .update("git-remote:github.com/anomalyco/opencode")
@@ -171,7 +188,7 @@ const RESPONSE_PLACEHOLDER_TOOLS = FINGERPRINT_TOOLS.map((name) => ({
 function buildProbe(model) {
  if (RESPONSES_MODELS.has(model)) {
   return {
-   relayPath: "/zen/v1/responses",
+   relayPath: PROBE_RESPONSES_PATH,
    body: JSON.stringify({
     model,
     input: "ping",
@@ -181,7 +198,7 @@ function buildProbe(model) {
   };
  }
  return {
-  relayPath: "/zen/v1/chat/completions",
+  relayPath: PROBE_CHAT_PATH,
   body: JSON.stringify({
    model,
    stream: true,
@@ -202,7 +219,7 @@ function probeHeaders(relayPath) {
   "x-opencode-request": `msg_${randomBytes(6).toString("hex")}${randomBytes(14).toString("base64url").slice(0, 14)}`,
   // Route through the in-container relay app; the public tunnel is bypassed
   // on purpose so a rotation never depends on tunnel state.
-  "x-relay-target": "https://opencode.ai",
+  "x-relay-target": PROBE_TARGET,
   "x-relay-path": relayPath,
   accept: "text/event-stream",
  };
