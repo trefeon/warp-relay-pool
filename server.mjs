@@ -43,14 +43,37 @@ function createRelayInstance(index) {
         res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
         return res.end(`Relay #${index} OK (via ${proxyUrl})\n\n${text}`);
       } catch (err) {
+        // Detail stays in the logs: the body used to reflect String(err).
+        console.error(`[relay #${index}] health check failed: ${err?.stack ?? String(err)}`);
         res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-        return res.end(`Relay #${index} proxy error: ${String(err)}`);
+        return res.end(`Relay #${index} health check failed\n`);
       }
     }
 
     if (!ALLOWED_TARGETS.includes(target)) {
       res.writeHead(403, { "content-type": "application/json" });
       return res.end(JSON.stringify({ error: "Forbidden target" }));
+    }
+
+    // The allowlist check above only validates the raw header string; the
+    // request URL is target + relayPath, and a crafted path can continue the
+    // host label (".attacker.tld/x" -> opencode.ai.attacker.tld), swap the
+    // port (":8443/x"), or inject userinfo ("@evil.tld/x"). Build the URL
+    // once and require it to stay on the allowlisted origin with a rooted
+    // path. Concat (not URL-relative resolution) preserves the legacy
+    // target+path semantics for any allowlist entry carrying a base path.
+    let upstreamUrl;
+    let targetOrigin;
+    try {
+      targetOrigin = new URL(target).origin;
+      upstreamUrl = new URL(target + relayPath);
+    } catch {
+      upstreamUrl = null;
+    }
+    if (!upstreamUrl || upstreamUrl.origin !== targetOrigin || !relayPath.startsWith("/")) {
+      console.error(`[relay #${index}] rejected relay path: target=${target} path=${relayPath}`);
+      res.writeHead(400, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ error: "Invalid relay path" }));
     }
 
     const headers = new Headers();
@@ -73,7 +96,7 @@ function createRelayInstance(index) {
     res.once("close", onClientClose);
     const upstreamTimeout = AbortSignal.timeout(300000);
     try {
-      const upstream = await fetch(target + relayPath, {
+      const upstream = await fetch(upstreamUrl, {
         method: req.method,
         headers,
         body: req.method !== "GET" && req.method !== "HEAD" ? req : undefined,
@@ -102,8 +125,11 @@ function createRelayInstance(index) {
       }
     } catch (err) {
       if (!res.headersSent) {
+        // Body stays generic: String(err) reflected attacker-controlled URLs
+        // and internal proxy names back to the caller.
+        console.error(`[relay #${index}] upstream error: ${err?.stack ?? String(err)}`);
         res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: String(err) }));
+        res.end(JSON.stringify({ error: "upstream request failed" }));
       } else {
         // Headers already on the wire (mid-stream failure) — just cut it.
         // Unconditional writeHead here crashed the process (ERR_HTTP_HEADERS_SENT).
