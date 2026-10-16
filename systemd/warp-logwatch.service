@@ -21,6 +21,6 @@ Group=warp-relay
 WorkingDirectory=/opt/warp-relay-pool
 # A scrape is seconds of docker/journal reads; 5 min is ample headroom.
 TimeoutStartSec=300
-ExecStart=/usr/bin/flock -n /tmp/warp-logwatch.lock /bin/sh /opt/warp-relay-pool/logwatch.sh
+ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-logwatch.lock /bin/sh /opt/warp-relay-pool/logwatch.sh
 StandardOutput=journal
 StandardError=journal

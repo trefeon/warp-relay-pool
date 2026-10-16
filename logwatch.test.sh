@@ -18,7 +18,9 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
-WATCH="$REPO/logwatch.sh"
+# WATCH=/path/to/logwatch.sh runs the suite against another copy (used
+# to prove the refetch regression tests fail on the pre-fix script).
+WATCH="${WATCH:-$REPO/logwatch.sh}"
 
 pass=0; fail=0; n=0
 t0="$(date +%s)"
@@ -447,6 +449,107 @@ sh "$WATCH" > "$T/out.txt" 2>&1
 rc=$?
 expect_eq "BUG: corrupt .events still exits 0" "$rc" "0"
 drop_sandbox
+
+# --- 23. refetch overlap: two distinct lines must fold --------------------
+# .cursor is the run START, so the next --since re-delivers every line
+# from [run-start, scrape-time]. The old single-line .last skip folded
+# only one boundary line: with a 2-line refetch (A,B then A,B,C) it
+# re-emitted and re-tallied A and B. Regression guard for the exact
+# A,B -> A,B,C repro.
+new_sandbox
+printf '2026-10-05T00:00:00Z A error one\n2026-10-05T00:00:01Z B failure two\n' \
+  > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "overlap2: run1 emits both lines" "$(wc -l < "$LOGS/errors.log")" "2"
+printf '2026-10-05T00:00:00Z A error one\n2026-10-05T00:00:01Z B failure two\n2026-10-05T00:00:02Z C timeout three\n' \
+  > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "overlap2: run2 appends ONLY the new line" \
+  "$(wc -l < "$LOGS/errors.log")" "3"
+expect_contains "overlap2: new line present" "$LOGS/errors.log" "C timeout three"
+expect_eq "overlap2: A not re-emitted" \
+  "$(grep -cF 'A error one' "$LOGS/errors.log")" "1"
+expect_eq "overlap2: B not re-emitted" \
+  "$(grep -cF 'B failure two' "$LOGS/errors.log")" "1"
+expect_eq "overlap2: tallies not inflated" \
+  "$(awk '{s+=$3} END{print s+0}' "$LOGS/.events")" "3"
+drop_sandbox
+
+# --- 24. refetch overlap on the journal source ----------------------------
+# Same fold through the "MMM DD HH:MM:SS" key path.
+new_sandbox
+j1='Oct 05 00:00:00 host warp-keep-cold[1]: troubled: still failing one'
+j2='Oct 05 00:00:01 host warp-keep-cold[1]: troubled: still failing two'
+j3='Oct 05 00:00:02 host warp-keep-cold[1]: troubled: still failing three'
+printf '%s\n%s\n' "$j1" "$j2" > "$FIX/journal.log"
+run_watch 1
+expect_eq "journal overlap: run1 emits both lines" "$(wc -l < "$LOGS/errors.log")" "2"
+printf '%s\n%s\n%s\n' "$j1" "$j2" "$j3" > "$FIX/journal.log"
+run_watch 1
+expect_eq "journal overlap: run2 appends ONLY the new line" \
+  "$(wc -l < "$LOGS/errors.log")" "3"
+expect_eq "journal overlap: first line not re-emitted" \
+  "$(grep -cF 'troubled: still failing one' "$LOGS/errors.log")" "1"
+expect_eq "journal overlap: tallies not inflated" \
+  "$(awk '{s+=$3} END{print s+0}' "$LOGS/.events")" "3"
+drop_sandbox
+
+# --- 25. repeat chain: identical refetches must not re-emit ---------------
+# Two extra runs over an unchanged refetch, then one new line: exactly
+# one more emission, ever.
+new_sandbox
+printf '2026-10-05T00:00:00Z A error one\n2026-10-05T00:00:01Z B failure two\n' \
+  > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+run_watch 1
+expect_eq "chain: unchanged refetch adds nothing" "$(wc -l < "$LOGS/errors.log")" "2"
+printf '2026-10-05T00:00:00Z A error one\n2026-10-05T00:00:01Z B failure two\n2026-10-05T00:00:02Z C timeout three\n' \
+  > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "chain: new line added exactly once" "$(wc -l < "$LOGS/errors.log")" "3"
+expect_eq "chain: tally total unchanged at 3" \
+  "$(awk '{s+=$3} END{print s+0}' "$LOGS/.events")" "3"
+drop_sandbox
+
+# --- 26. same-second burst: identical lines, one timestamp ----------------
+# Three byte-identical lines share one exact timestamp; a 4th identical
+# line arrives before the next run. Text identity cannot tell how many
+# were already counted — only the stored per-key occurrence count can.
+new_sandbox
+burst='2026-10-05T00:00:00Z 429 too many requests'
+printf '%s\n%s\n%s\n' "$burst" "$burst" "$burst" > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_contains "burst: run1 collapses the trio" "$LOGS/errors.log" \
+  "429 too many requests (x3)"
+printf '%s\n%s\n%s\n%s\n' "$burst" "$burst" "$burst" "$burst" > "$FIX/docker-warp-relay-warp-1.log"
+run_watch 1
+expect_eq "burst: run2 adds exactly the 4th occurrence" \
+  "$(wc -l < "$LOGS/errors.log")" "2"
+expect_absent "burst: no re-collapsed (x6) line" "$LOGS/errors.log" "(x6)"
+expect_eq "burst: tally total is exactly 4" \
+  "$(awk '{s+=$3} END{print s+0}' "$LOGS/.events")" "4"
+drop_sandbox
+
+# --- 27. journal same-second burst ----------------------------------------
+# Journal stamps whole seconds, so same-key bursts are the norm there.
+new_sandbox
+jburst='Oct 05 12:00:00 host warp-keep-cold[1]: 429 too many requests'
+printf '%s\n%s\n' "$jburst" "$jburst" > "$FIX/journal.log"
+run_watch 1
+expect_contains "journal burst: run1 collapses the pair" "$LOGS/errors.log" "(x2)"
+printf '%s\n%s\n%s\n' "$jburst" "$jburst" "$jburst" > "$FIX/journal.log"
+run_watch 1
+expect_eq "journal burst: run2 adds exactly one occurrence" \
+  "$(wc -l < "$LOGS/errors.log")" "2"
+expect_eq "journal burst: tally total is exactly 3" \
+  "$(awk '{s+=$3} END{print s+0}' "$LOGS/.events")" "3"
+drop_sandbox
+
+# --- 28. flock contention is a successful no-op ---------------------------
+# -E 0 makes timer overlap exit 0 so a skipped run never marks the unit
+# failed; the flock -n serialization itself must stay.
+expect_contains "unit: flock still serializes (-n)" "$svc" "flock -n"
+expect_contains "unit: flock contention exits 0 (-E 0)" "$svc" "-E 0"
 
 t1="$(date +%s)"
 printf '# %d passed, %d failed (%ds)\n' "$pass" "$fail" "$((t1 - t0))"
