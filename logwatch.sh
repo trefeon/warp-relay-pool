@@ -132,8 +132,11 @@ get_boundary() {
   # The stored key must also match a KNOWN key shape: one of the two
   # junk sentinels or a year-bounded real key of either mode. Anything
   # else is corrupt state (hand-edited, truncated, or the pre-fix
-  # content-derived junk key surviving an in-place upgrade) and is
+  # content-derived docker key surviving an in-place upgrade) and is
   # treated as absent — the skip then re-emits instead of swallowing;
+  # the old journal pseudo-key 20YY0000000000 stays shape-valid and is
+  # provably harmless (it sorts below that year's real keys, and junk
+  # keys are exempt from the '<' branch anyway).
   # when loss and duplication conflict, duplication is the safe side.
   # (Repeated [0-9] classes, not {9}/{10} intervals: pre-2020 mawk and
   # traditional awk lack ERE intervals.)
