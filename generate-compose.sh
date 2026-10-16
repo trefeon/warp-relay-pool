@@ -18,10 +18,14 @@ set -eu
 # The relevant values are baked into the generated compose file, which is why
 # editing .env alone changes nothing until this script runs again.
 if [ -f .env ]; then
+  cr="$(printf '\r')"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%=*}"
     val="${line#*=}"
+    # Windows-authored files may carry CRLF: a stray CR in a baked value
+    # (URL, comma-list) would silently break matching downstream.
+    val="${val%"$cr"}"
     case "$key" in *[!A-Za-z0-9_]*|'') continue ;; esac
     case "$val" in
       \"*\") val="${val#\"}"; val="${val%\"}" ;;
