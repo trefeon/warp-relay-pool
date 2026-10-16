@@ -3,6 +3,8 @@
 # Topology: bridge 10.244.0.0/16, relay app fixed at 10.244.0.100.
 # warp-N raw SOCKS5 proxy on 127.0.0.1:<10800+N> (override bind: WARP_BIND),
 # relay router (mesh-VPN ingress) on 127.0.0.1:3101-3110 (override bind: INGRESS_BIND).
+# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS) is baked from
+# the generation-time environment / .env — regenerate after editing either.
 networks:
   default:
     ipam:
@@ -226,6 +228,8 @@ services:
     restart: always
     environment:
       - RELAY_COUNT=10
+      - BASE_PORT=3000
+      - RELAY_ALLOWED_TARGETS=https://opencode.ai,https://api.kilo.ai
     networks:
       default:
         ipv4_address: 10.244.0.100

@@ -90,6 +90,8 @@ cat <<HEADER
 # Topology: bridge 10.244.0.0/16, relay app fixed at 10.244.0.100.
 # warp-N raw SOCKS5 proxy on ${SOCKS_BIND}:<10800+N> (override bind: WARP_BIND),
 # ${ROUTER_LINE}.
+# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS) is baked from
+# the generation-time environment / .env — regenerate after editing either.
 networks:
   default:
     ipam:
@@ -157,6 +159,8 @@ cat <<ENTRY
     restart: always
     environment:
       - RELAY_COUNT=${COUNT}
+      - BASE_PORT=${BASE_PORT:-3000}
+      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai}
     networks:
       default:
         ipv4_address: 10.244.0.100
@@ -170,6 +174,8 @@ cat <<ENTRY
     restart: always
     environment:
       - RELAY_COUNT=${COUNT}
+      - BASE_PORT=${BASE_PORT:-3000}
+      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai}
     networks:
       default:
         ipv4_address: 10.244.0.100
