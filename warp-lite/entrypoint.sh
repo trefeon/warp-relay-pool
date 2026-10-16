@@ -523,7 +523,8 @@ show_egress_ip() {
             https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"; then
             ip_line="$(printf '%s\n' "$out" | grep '^ip=' || true)"
             if [ -n "$ip_line" ]; then
-                log "  IPv4 ${ip_line}"
+                warp_line="$(printf '%s\n' "$out" | grep '^warp=' || true)"
+                log "  IPv4 ${ip_line}${warp_line:+ }${warp_line}"
                 v4_ok=1
             fi
         fi
