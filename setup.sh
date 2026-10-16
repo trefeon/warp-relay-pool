@@ -16,6 +16,12 @@ if [ -f .env ]; then
     val="${line#*=}"
     val="${val%"$cr"}"
     case "$key" in ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;; esac
+    # The wizard owns the pool size for wizard-driven installs (VPS sizing),
+    # so a copied .env.example COUNT=10 does not silently out-vote the
+    # recommended count on a small VPS; pin one with `COUNT=5 ./setup.sh`
+    # (process env still wins above). BASE_PORT and the binds DO flow here:
+    # generate-compose.sh bakes them and the unit must match.
+    case "$key" in COUNT|RELAY_COUNT) continue ;; esac
     case "$val" in
       \"*\") val="${val#\"}"; val="${val%\"}" ;;
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
