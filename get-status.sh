@@ -35,6 +35,8 @@ fi
 SOCKS_BIND="$(sed -n 's/^ *- "\([^":]*\):[0-9][0-9]*:1080"$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
 [ -n "$SOCKS_BIND" ] || SOCKS_BIND="127.0.0.1"
 ROUTER_BIND="$(sed -n 's/^ *- "\([^":]*\):3101-.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+BASE_PORT="$(sed -n 's/^ *- BASE_PORT=\([0-9][0-9]*\)$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+[ -n "$BASE_PORT" ] || BASE_PORT=3000
 
 tunnel_url() {
   docker logs "warp-relay-tunnel-$1" 2>&1 \
@@ -67,7 +69,7 @@ echo "--------------------------------------------------------------------------
 
 i=1
 while [ "$i" -le "$COUNT" ]; do
-  PORT=$((3000 + i))
+  PORT=$((BASE_PORT + i))
 
   URL="$(tunnel_url "$i")"
   [ -z "$URL" ] && URL="(none / mesh-VPN direct)"

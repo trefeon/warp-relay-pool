@@ -29,6 +29,9 @@ Environment=KEEP_COLD_LOG=/opt/warp-relay-pool/keep-cold.log
 # probes nonexistent relays. The wizard (setup.sh) rewrites this line to the
 # actual count; edit it if you install the unit by hand.
 Environment=COUNT=10
+# Base port of the relay listeners (relay N listens on BASE_PORT+N). Must
+# match the generated compose; the wizard rewrites it from .env/default.
+Environment=BASE_PORT=3000
 ExecStart=/usr/bin/flock -n /tmp/warp-keep-cold.lock /usr/bin/node /opt/warp-relay-pool/keep-cold.mjs --once
 StandardOutput=journal
 StandardError=journal

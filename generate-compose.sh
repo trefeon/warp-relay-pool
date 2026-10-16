@@ -21,12 +21,17 @@ if [ -f .env ]; then
   cr="$(printf '\r')"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
+    # A value-less line is not a KEY=VALUE assignment — skip it instead of
+    # self-assigning KEY=KEY.
+    case "$line" in *=*) ;; *) continue ;; esac
     key="${line%%=*}"
     val="${line#*=}"
     # Windows-authored files may carry CRLF: a stray CR in a baked value
     # (URL, comma-list) would silently break matching downstream.
     val="${val%"$cr"}"
-    case "$key" in *[!A-Za-z0-9_]*|'') continue ;; esac
+    # Shell-identifier keys only; a leading digit would alias positional
+    # parameters or die under `set -u` despite the skip contract.
+    case "$key" in ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;; esac
     case "$val" in
       \"*\") val="${val#\"}"; val="${val%\"}" ;;
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
@@ -61,10 +66,11 @@ if [ "$COUNT" -lt 1 ] || [ "$COUNT" -gt 64 ]; then
 fi
 if [ "$WITH_TUNNELS" = true ]; then TUNNEL_FLAG=" --with-tunnels"; else TUNNEL_FLAG=""; fi
 
+BASE_PORT="${BASE_PORT:-3000}"
 HOST_LO=$((3100 + 1))
 HOST_HI=$((3100 + COUNT))
-CONT_LO=$((3000 + 1))
-CONT_HI=$((3000 + COUNT))
+CONT_LO=$((BASE_PORT + 1))
+CONT_HI=$((BASE_PORT + COUNT))
 
 # Host binds default to loopback: the SOCKS proxies are unauthenticated and
 # the relay router trusts anyone who can reach it. The relay app dials
@@ -203,7 +209,7 @@ if [ "$WITH_TUNNELS" = true ]; then
 # and breaks every configured client line).
 i=1
 while [ "$i" -le "$COUNT" ]; do
-PORT=$((3000 + i))
+PORT=$((BASE_PORT + i))
 cat <<ENTRY
   tunnel-${i}:
     image: cloudflare/cloudflared:latest
