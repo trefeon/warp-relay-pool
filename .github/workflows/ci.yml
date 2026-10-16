@@ -45,7 +45,7 @@ jobs:
       - name: Relay guard integration tests
         run: |
           if ls test/*.test.mjs >/dev/null 2>&1; then
-            node --test test/
+            node --test test/*.test.mjs
           else
             echo "no relay tests yet"
           fi
