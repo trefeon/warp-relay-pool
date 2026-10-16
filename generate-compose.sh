@@ -12,6 +12,27 @@
 # Rotation rule: restart warp-N only, never tunnel-N/relay.
 set -eu
 
+# Load .env when present. Only KEY=VALUE lines with shell-safe key names are
+# applied, and values already present in the process environment win — so
+# `COUNT=5 ./generate-compose.sh` and setup.sh prompts are never overridden.
+# The relevant values are baked into the generated compose file, which is why
+# editing .env alone changes nothing until this script runs again.
+if [ -f .env ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    case "$key" in *[!A-Za-z0-9_]*|'') continue ;; esac
+    case "$val" in
+      \"*\") val="${val#\"}"; val="${val%\"}" ;;
+      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    # shellcheck disable=SC2163,SC2086 # key is validated above
+    eval "cur=\${$key:-}"
+    [ -n "$cur" ] || export "$key=$val"
+  done < .env
+fi
+
 COUNT="${COUNT:-10}"
 WITH_TUNNELS=false
 USE_LITE=true

@@ -82,8 +82,11 @@ curl -s -N <RELAY-1-URL>/anything \
   -H "x-relay-path: /zen/v1/models"
 ```
 
-`x-relay-target` must be exactly one of the allowlist (`RELAY_ALLOWED_TARGETS`
-in `.env.example`, default `https://opencode.ai`, `https://api.kilo.ai`);
-anything else is `403`. `x-relay-path` defaults to `/`. To allow another
-upstream, set the env, then `docker compose build relay && docker compose up -d relay`
-(COPY-baked image — see [02](02-deploy.md)).
+`x-relay-target` must be exactly one of the allowlist (`RELAY_ALLOWED_TARGETS`,
+default `https://opencode.ai`, `https://api.kilo.ai`); anything else is `403`.
+A path that would leave the target host (e.g. `.attacker.tld/...`) is `400`.
+`x-relay-path` defaults to `/`. To allow another upstream: set
+`RELAY_ALLOWED_TARGETS` in `.env` (the generator sources it) or export it,
+then re-run `./generate-compose.sh <count> [--with-tunnels]` and
+`docker compose up -d` — the value is baked into the relay service
+environment at generation time (see [02](02-deploy.md)).

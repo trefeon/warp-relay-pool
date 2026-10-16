@@ -356,6 +356,7 @@ if [ -n "$NODE_BIN" ] && command -v systemctl >/dev/null 2>&1; then
         -e "s|^WorkingDirectory=.*|WorkingDirectory=${CURRENT_DIR}|" \
         -e "s|^Documentation=.*|Documentation=file:${CURRENT_DIR}/keep-cold.mjs|" \
         -e "s|^Environment=KEEP_COLD_LOG=.*|Environment=KEEP_COLD_LOG=${CURRENT_DIR}/keep-cold.log|" \
+        -e "s|^Environment=COUNT=.*|Environment=COUNT=${COUNT}|" \
         -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n /tmp/warp-keep-cold.lock ${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --once|" \
         systemd/warp-keep-cold.service > "$TMP_SERVICE"
 

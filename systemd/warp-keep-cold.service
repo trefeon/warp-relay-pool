@@ -25,6 +25,10 @@ TimeoutStartSec=900
 # The script rotates its own log, so no shell wrapper is needed here.
 # Adjust the path below to where you cloned this repo.
 Environment=KEEP_COLD_LOG=/opt/warp-relay-pool/keep-cold.log
+# Pool size for the prober: must match the deployed relay count or the pass
+# probes nonexistent relays. The wizard (setup.sh) rewrites this line to the
+# actual count; edit it if you install the unit by hand.
+Environment=COUNT=10
 ExecStart=/usr/bin/flock -n /tmp/warp-keep-cold.lock /usr/bin/node /opt/warp-relay-pool/keep-cold.mjs --once
 StandardOutput=journal
 StandardError=journal

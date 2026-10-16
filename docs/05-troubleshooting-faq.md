@@ -15,10 +15,12 @@ per-egress 429 for a pool-wide URL churn. See [04](04-operations-keep-cold.md).
 Relay rebuilds can't cause this: tunnels carry no `depends_on: - relay`.
 
 **403 `Forbidden target`.** `x-relay-target` is not in the allowlist
-(`RELAY_ALLOWED_TARGETS` in `.env.example`, default `https://opencode.ai`,
-`https://api.kilo.ai`). Fix the header (trailing `/`
-is stripped for you) or set the env and
-`docker compose build relay && docker compose up -d relay`.
+(`RELAY_ALLOWED_TARGETS`, default `https://opencode.ai`,
+`https://api.kilo.ai`). Fix the header (a trailing `/` is stripped for you)
+or set the env and re-run
+`./generate-compose.sh <count> [--with-tunnels] && docker compose up -d`
+(the generator bakes the allowlist into the relay service environment;
+editing `.env` alone rebuilds nothing).
 
 **Mesh-VPN relay URLs skipped by the client.** A pi-freeflow build without
 mesh-VPN peer relay support accepts https-only relay URLs and silently
