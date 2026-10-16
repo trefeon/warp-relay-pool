@@ -35,6 +35,10 @@ if [ -f .env ]; then
     case "$val" in
       \"*\") val="${val#\"}"; val="${val%\"}" ;;
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
+      # Bare values follow compose's env-file behaviour: a whitespace-preceded
+      # `#…` starts an inline comment and is stripped. A quoted value keeps
+      # its bytes (a ` #` inside quotes is part of the value).
+      *) val="${val%%[[:space:]]#*}" ;;
     esac
     # shellcheck disable=SC2163,SC2086 # key is validated above
     eval "cur=\${$key:-}"
