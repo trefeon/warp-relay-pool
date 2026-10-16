@@ -47,7 +47,7 @@ network. `warpReady` in `keep-cold.mjs` gates rotation on Connected +
 real egress for exactly this reason.
 
 **Host port already in use.** If `docker compose up` fails binding `310N`
-or `1080N` (a local service already claims it — `:3002` collisions are the
+or `10800+N` (a local service already claims it — `:3002` collisions are the
 classic case), pick a free range and edit the `ports:` lines in
 `docker-compose.yml` (or the generator), then `up` again. Client lines use
 whatever host ports you publish.

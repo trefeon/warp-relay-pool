@@ -52,16 +52,16 @@ Or run non-interactively with auto-detected sizing recommendations:
 For most users and developers running parallel coding subagents, **5 relays** is optimal:
 - **5 Independent Egress IPs:** Upstream rate limits (HTTP 429) are tracked per-IP per-model. 5 relays provide 5x throughput burst capacity.
 - **Ultra-Low Memory Consumption:**
-  - With **TryCloudflare Quick Tunnels**: ~140 MB total RAM (fits comfortably on any 512 MB or 1 GB VPS).
+  - With **TryCloudflare Quick Tunnels**: ~160 MB total RAM (fits comfortably on any 512 MB or 1 GB VPS).
   - With **Tailscale Mesh-VPN**: ~50 MB total RAM.
 - **Auto-Recovery:** If one relay hits a rate limit, the background controller rotates that single container's egress IP while the remaining 4 relays continue serving turns seamlessly.
 
 | VPS Plan | Ingress Mode | Recommended Relays | Total Stack Memory |
 |---|---|---|---|
-| **512 MB VPS** | TryCloudflare Tunnels | 5 relays | ~140 MB |
+| **512 MB VPS** | TryCloudflare Tunnels | 5 relays | ~160 MB |
 | **512 MB VPS** | Tailscale Mesh-VPN | 5 – 10 relays | ~50 – 60 MB |
-| **1 GB VPS** | TryCloudflare Tunnels | 5 – 10 relays | ~140 – 250 MB |
-| **2 GB+ VPS** | TryCloudflare Tunnels | 10 – 20 relays | ~250 – 500 MB |
+| **1 GB VPS** | TryCloudflare Tunnels | 5 – 10 relays | ~160 – 270 MB |
+| **2 GB+ VPS** | TryCloudflare Tunnels | 10 – 20 relays | ~270 – 490 MB |
 
 ---
 

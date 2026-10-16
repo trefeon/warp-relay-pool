@@ -34,7 +34,7 @@ Each listener forwards through its own MicroWARP client's SOCKS proxy
    — SSE tokens stream, nothing buffers. See `server.mjs`.
 4. No `x-relay-target` header = health check: relay fetches
    `https://cloudflare.com/cdn-cgi/trace` through its own dispatcher and
-   returns `Relay #N OK (via http://warp-N:1080)` plus the trace body.
+   returns `Relay #N OK (via socks5://warp-N:1080)` plus the trace body.
    A per-relay egress proof, not a load-balancer ping.
 5. Target not in the allowlist (`RELAY_ALLOWED_TARGETS`, default
    `https://opencode.ai`, `https://api.kilo.ai`) = `403 {"error":"Forbidden target"}`.

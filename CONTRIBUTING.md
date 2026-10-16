@@ -32,8 +32,14 @@ Run before opening a PR:
 ```sh
 node --check server.mjs
 node --check keep-cold.mjs
+sh -n generate-compose.sh setup.sh get-status.sh logwatch.sh warp-lite/entrypoint.sh
+bash logwatch.test.sh
+node --test test/*.test.mjs
 docker compose config
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same gates plus a regeneration
+determinism check on `docker-compose.yml`.
 
 ## Style
 

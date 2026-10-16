@@ -12,7 +12,7 @@ For mesh-VPN ingress, the host must already be joined to your tailnet.
 
 The interactive wizard handles everything automatically:
 - Checks and installs missing prerequisites (Docker, Docker Compose, Node.js).
-- Detects VPS RAM and CPU cores, recommends safe relay limits, and defaults to the **5-relay sweet spot** (~140 MB total RAM).
+- Detects VPS RAM and CPU cores, recommends safe relay limits, and defaults to the **5-relay sweet spot** (~160 MB total RAM).
 - Builds the minimal MicroWARP image (`warp-lite:latest`, ~1.8 MiB RAM/node).
 - Deploys TryCloudflare Quick Tunnels (public HTTPS URLs, zero client VPN needed) or Mesh-VPN direct.
 - Installs the `warp-keep-cold.timer` systemd service for automatic 429 rate-limit recovery.
@@ -31,7 +31,7 @@ To run non-interactively with auto-detected recommendations:
 
 ```bash
 ./generate-compose.sh 5 --with-tunnels
-docker compose up -d --build # ~140 MiB resident total for 5 relays + tunnels
+docker compose up -d --build # ~160 MiB resident total for 5 relays + tunnels
 ./get-status.sh              # prints live public tunnel URLs + client commands
 ```
 
@@ -43,9 +43,11 @@ docker compose up -d --build # ~50 MiB resident total for 5 relays
 ./get-status.sh              # ports, egress IPs, mesh-VPN client commands
 ```
 `get-status.sh [count]` (default `COUNT` env, else 10) reads live state
-off the host: egress IPs from
-`docker exec warp-relay-warp-N curl …/cdn-cgi/trace`, tunnel URLs from
-`docker logs warp-relay-tunnel-N`. Its output is host-only — never commit it.
+off the host: egress IPs primarily via the host-side SOCKS probe
+(`curl -x socks5h://127.0.0.1:<10800+N>` against that relay's WARP
+egress, with a `docker exec warp-relay-warp-N curl …/cdn-cgi/trace`
+fallback), tunnel URLs from `docker logs warp-relay-tunnel-N`. Its
+output is host-only — never commit it.
 
 ## Rescale to N relays
 
@@ -82,6 +84,20 @@ so overlapping timer fires never stack. The timer fires every 5 minutes
 (`OnCalendar`). Without `--loop`, one pass = one timer fire.
 See [04](04-operations-keep-cold.md) for tuning (notably
 `GLOBAL_QUOTA_GUARD`).
+
+## Error watcher (logwatch, optional)
+
+`logwatch.sh` scrapes the relay/WARP container logs and the keep-cold
+journal into `logs/errors.log` (rotated) and writes per-relay/day tallies
+for rollover summaries; state lives in `logs/.cursor` / `.last` /
+`.events`.
+
+```bash
+sudo cp systemd/warp-logwatch.{service,timer} /etc/systemd/system/  # edit paths first
+sudo systemctl enable --now warp-logwatch.timer   # every 2 minutes; flock-guarded
+```
+
+Its suite is part of CI: `bash logwatch.test.sh`.
 
 ## Rebuild, don't restart
 
