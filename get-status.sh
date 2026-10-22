@@ -11,9 +11,13 @@
 # when absent).
 #
 # Usage: ./get-status.sh [count]     (default COUNT env, else 10)
-# Missing/stopped containers print "(starting...)" / "(not ready)" and
-# never abort the table (safe under `set -e` callers too).
+# Missing/stopped containers print "(not ready)" and never abort the table
+# (safe under `set -e` callers too).
 set -u
+
+# Operate on the checkout this script lives in, not the caller's CWD.
+POOL_DIR="${POOL_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+cd "$POOL_DIR" || exit 1
 
 COUNT="${1:-${COUNT:-10}}"
 
@@ -34,7 +38,8 @@ fi
 # mirror the generator's loopback binds when no compose file exists.
 SOCKS_BIND="$(sed -n 's/^ *- "\([^":]*\):[0-9][0-9]*:1080"$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
 [ -n "$SOCKS_BIND" ] || SOCKS_BIND="127.0.0.1"
-ROUTER_BIND="$(sed -n 's/^ *- "\([^":]*\):3101-.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+ROUTER_PUBLISHED="$(sed -n 's/^ *- "\([^":]*\):3101-.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+ROUTER_BIND="$ROUTER_PUBLISHED"
 BASE_PORT="$(sed -n 's/^ *- BASE_PORT=\([0-9][0-9]*\)$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
 [ -n "$BASE_PORT" ] || BASE_PORT=3000
 
@@ -67,9 +72,19 @@ echo "=== WARP relay status (1..${COUNT}) ==="
 printf "%-10s %-8s %-34s %s\n" "INSTANCE" "PORT" "EGRESS IP" "TUNNEL URL"
 echo "--------------------------------------------------------------------------------------------"
 
+SEEN_IPS=""
+DUP_IPS=""
 i=1
 while [ "$i" -le "$COUNT" ]; do
-  PORT=$((BASE_PORT + i))
+  # The table must show what a client dials: the host-published 310N port in
+  # mesh mode, or the in-network BASE_PORT+N when nothing is published.
+  if [ -n "$ROUTER_PUBLISHED" ]; then
+    PORT="$((3100 + i))"
+    PORT_LABEL=":${PORT}"
+  else
+    PORT="$((BASE_PORT + i))"
+    PORT_LABEL=":${PORT}*"
+  fi
 
   URL="$(tunnel_url "$i")"
   [ -z "$URL" ] && URL="(none / mesh-VPN direct)"
@@ -78,10 +93,27 @@ while [ "$i" -le "$COUNT" ]; do
   # rather than through the relay app.
   IP="$(egress_ip "$i")"
   [ -z "$IP" ] && IP="(not ready)"
+  case "$IP" in
+    "(not ready)"|"") ;;
+    *)
+      case " ${SEEN_IPS} " in
+        *" ${IP} "*) DUP_IPS="${DUP_IPS} ${IP}" ;;
+        *) SEEN_IPS="${SEEN_IPS} ${IP}" ;;
+      esac
+      ;;
+  esac
 
-  printf "%-10s %-8s %-34s %s\n" "warp-${i}" ":${PORT}" "$IP" "$URL"
+  printf "%-10s %-9s %-34s %s\n" "warp-${i}" "$PORT_LABEL" "$IP" "$URL"
   i=$((i + 1))
 done
+if [ -n "$DUP_IPS" ]; then
+  echo ""
+  echo "note: relays share egress IP(s)${DUP_IPS} — expected on IPv4 (Cloudflare"
+  echo "      WARP CGNAT); per-relay isolation is per-IPv6 egress address."
+fi
+if [ -z "$ROUTER_PUBLISHED" ]; then
+  echo "* in-network relay port (tunnels mode publishes no host port)"
+fi
 
 TS_IP="$(mesh_ip)"
 [ -z "$TS_IP" ] && TS_IP="<tailscale-ip>"

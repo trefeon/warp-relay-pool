@@ -6,13 +6,24 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  # gitleaks-action reads the PR commit list on pull_request events.
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
@@ -31,21 +42,34 @@ jobs:
           done
           bash -n logwatch.test.sh
 
+      - name: ShellCheck (errors)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -S error generate-compose.sh setup.sh get-status.sh \
+            logwatch.sh logwatch.test.sh warp-lite/entrypoint.sh
+
       - name: Compose generation is deterministic
         run: |
           sh ./generate-compose.sh 10
           git diff --exit-code docker-compose.yml
 
-      - name: Install relay deps
-        run: npm install --no-audit --no-fund
+      - name: Compose file validates
+        run: docker compose config -q
+
+      - name: warp-lite image builds
+        run: docker build -t warp-lite:ci ./warp-lite
+
+      - name: Install relay deps (lockfile)
+        run: npm ci --no-audit --no-fund
 
       - name: Logwatch test suite
         run: bash logwatch.test.sh
 
-      - name: Relay guard integration tests
-        run: |
-          if ls test/*.test.mjs >/dev/null 2>&1; then
-            node --test test/*.test.mjs
-          else
-            echo "no relay tests yet"
-          fi
+      - name: Relay + keep-cold tests
+        run: node --test test/*.test.mjs
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

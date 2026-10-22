@@ -38,6 +38,8 @@ Each listener forwards through its own MicroWARP client's SOCKS proxy
    A per-relay egress proof, not a load-balancer ping.
 5. Target not in the allowlist (`RELAY_ALLOWED_TARGETS`, default
    `https://opencode.ai`, `https://api.kilo.ai`) = `403 {"error":"Forbidden target"}`.
+   The allowlist covers every hop: upstream `3xx` redirects are refused
+   (`502`), so an allowlisted origin cannot steer the relay elsewhere.
 
 ## Header protocol
 
@@ -81,7 +83,10 @@ The `relay` service publishes `${INGRESS_BIND}:3101-<3100+N>` → container `300
 
 ## Why per-relay WARP egress
 
-Each `warp-N` (minimal MicroWARP `warp-lite:latest`, `NET_ADMIN`) owns its egress
-address, so upstream per-IP throttling (HTTP 429) hits one relay, not the
-pool. Rotating one `warp-N` buys a fresh `<EGRESS-IP>` while every
-client URL keeps working. That isolation is the whole pool design.
+Each `warp-N` (minimal MicroWARP `warp-lite:latest`, `NET_ADMIN`) owns its
+IPv6 egress `/128`, so upstream per-IP throttling (HTTP 429) hits one relay,
+not the pool. IPv4 egress is Cloudflare CGNAT, shared across the pool; an
+IPv4-only upstream can therefore throttle several relays at once, which is
+what `GLOBAL_QUOTA_GUARD` and the duplicate-IP note in `get-status.sh` are
+for. Rotating one `warp-N` buys a fresh egress address while every client
+URL keeps working. That isolation is the whole pool design.

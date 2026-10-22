@@ -119,14 +119,35 @@ if ! command -v docker >/dev/null 2>&1; then
   fi
 
   if [ "$DO_INSTALL_DOCKER" = true ]; then
+    if ! command -v apt-get >/dev/null 2>&1 && ! command -v dnf >/dev/null 2>&1 && ! command -v yum >/dev/null 2>&1; then
+      log_err "Automatic Docker installation is supported on Debian/Ubuntu/Fedora/CentOS only."
+      log_err "Install Docker + the compose plugin with your package manager, then re-run."
+      exit 1
+    fi
     log_info "Installing Docker via official install script..."
-    curl -fsSL https://get.docker.com | run_elevated sh
+    # Download first: a curl failure in a pipe is invisible to `sh` without
+    # pipefail, which POSIX sh does not have.
+    DOCKER_INSTALLER="$(mktemp)"
+    if ! curl -fsSL https://get.docker.com -o "$DOCKER_INSTALLER"; then
+      rm -f "$DOCKER_INSTALLER"
+      log_err "Downloading https://get.docker.com failed."
+      exit 1
+    fi
+    if ! run_elevated sh "$DOCKER_INSTALLER"; then
+      rm -f "$DOCKER_INSTALLER"
+      log_err "The Docker install script failed."
+      exit 1
+    fi
+    rm -f "$DOCKER_INSTALLER"
     if [ "$(id -u)" -ne 0 ] && command -v usermod >/dev/null 2>&1; then
-      run_elevated usermod -aG docker "$USER" || true
+      if ! run_elevated usermod -aG docker "$USER"; then
+        log_warn "Could not add ${USER} to the docker group; the wizard will continue under sudo."
+      fi
     fi
     if command -v systemctl >/dev/null 2>&1; then
       run_elevated systemctl enable --now docker || true
     fi
+    command -v docker >/dev/null 2>&1 || { log_err "Docker is still missing after installation."; exit 1; }
     log_ok "Docker installed successfully."
   else
     log_err "Docker is required to run the relay pool. Please install Docker and retry."
@@ -158,12 +179,24 @@ else
     exit 1
   fi
 fi
+# The daemon socket needs group membership that a fresh `usermod` does not
+# apply to this shell. `docker compose version` is client-side and passes
+# anyway, so check the daemon itself and re-exec under sudo when needed.
+if ! docker info >/dev/null 2>&1; then
+  if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    log_info "Docker daemon not reachable as $(id -un); re-running the wizard under sudo..."
+    exec sudo -E sh "$0" "$@"
+  fi
+  log_err "Cannot reach the Docker daemon."
+  log_err "Re-login after 'usermod -aG docker $USER', or run this script with sudo."
+  exit 1
+fi
 log_ok "Docker and Docker Compose verified ($DOCKER_COMPOSE)."
 
 # Auto-install Node.js if missing (for keep-cold rotation prober)
 NODE_BIN="$(command -v node 2>/dev/null || true)"
 if [ -z "$NODE_BIN" ]; then
-  log_warn "Node.js (>=18) is needed for keep-cold auto-rotation prober."
+  log_warn "Node.js (>=22) is needed for keep-cold auto-rotation prober."
   DO_INSTALL_NODE=true
   if [ "$AUTO_YES" != true ]; then
     printf "Install Node.js on the VPS for rate-limit auto-rotation? [Y/n]: "
@@ -177,10 +210,17 @@ if [ -z "$NODE_BIN" ]; then
   if [ "$DO_INSTALL_NODE" = true ]; then
     log_info "Installing Node.js..."
     if command -v apt-get >/dev/null 2>&1; then
-      curl -fsSL https://deb.nodesource.com/setup_22.x | run_elevated bash -
-      run_elevated apt-get install -y nodejs
+      NODE_INSTALLER="$(mktemp)"
+      if curl -fsSL https://deb.nodesource.com/setup_22.x -o "$NODE_INSTALLER"; then
+        run_elevated bash "$NODE_INSTALLER"
+        rm -f "$NODE_INSTALLER"
+        run_elevated apt-get install -y nodejs
+      else
+        rm -f "$NODE_INSTALLER"
+        log_warn "Could not download the NodeSource setup script."
+      fi
     elif command -v dnf >/dev/null 2>&1; then
-      run_elevated dnf module install -y nodejs:20
+      run_elevated dnf module install -y nodejs:22 || run_elevated dnf install -y nodejs
     elif command -v apk >/dev/null 2>&1; then
       run_elevated apk add nodejs
     fi
@@ -268,7 +308,35 @@ echo ""
 # -------------------------------------------------------------
 # 3. Interactive Relay Selection
 # -------------------------------------------------------------
-COUNT="${COUNT:-$REC_COUNT}"
+# Re-running the wizard on an existing host must not silently shrink the pool
+# (Docker leaves the removed warp containers and their volumes running).
+# Adopt the deployed shape unless COUNT/INGRESS are pinned explicitly.
+DEPLOYED_COUNT="$(docker inspect warp-relay-app --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^RELAY_COUNT=\([0-9][0-9]*\)$/\1/p' | head -n 1 || true)"
+DEPLOYED_INGRESS=""
+if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'warp-relay-tunnel-1'; then
+  DEPLOYED_INGRESS="tunnels"
+elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'warp-relay-app'; then
+  DEPLOYED_INGRESS="tailscale"
+fi
+# The binds are part of the deployed shape too: a re-run must not silently
+# re-publish a deliberately exposed WARP_BIND (or a custom router bind) as
+# loopback. The compose file is the deployed truth; explicit env wins.
+if [ -z "${WARP_BIND:-}" ] && [ -f docker-compose.yml ]; then
+  WARP_BIND="$(sed -n 's/^ *- "\([^":]*\):[0-9][0-9]*:1080"$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+  [ -n "$WARP_BIND" ] && export WARP_BIND
+fi
+if [ -z "${INGRESS_BIND:-}" ] && [ -f docker-compose.yml ]; then
+  INGRESS_BIND="$(sed -n 's/^ *- "\([^":]*\):3101-.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+  [ -n "$INGRESS_BIND" ] && export INGRESS_BIND
+fi
+
+COUNT_FROM_DEPLOY=0
+if [ -z "${COUNT:-}" ] && [ -n "$DEPLOYED_COUNT" ]; then
+  COUNT="$DEPLOYED_COUNT"
+  COUNT_FROM_DEPLOY=1
+else
+  COUNT="${COUNT:-$REC_COUNT}"
+fi
 case "$COUNT" in
   ''|*[!0-9]*)
     log_warn "COUNT='${COUNT}' is not a number; using the recommended ${REC_COUNT}."
@@ -276,42 +344,63 @@ case "$COUNT" in
     ;;
 esac
 if [ "$COUNT" -gt "$MAX_RELAYS" ]; then
-  log_warn "COUNT=${COUNT} exceeds the safe maximum for this VPS (${MAX_RELAYS}); using ${MAX_RELAYS}."
-  COUNT="$MAX_RELAYS"
+  if [ "$COUNT_FROM_DEPLOY" -eq 1 ]; then
+    # The stack already runs this size; free RAM is low precisely because of
+    # it. Shrinking here would orphan containers/volumes on a re-run.
+    log_warn "Deployed count ${COUNT} is above the fresh-install recommendation (${MAX_RELAYS}); keeping it."
+  else
+    log_warn "COUNT=${COUNT} exceeds the safe maximum for this VPS (${MAX_RELAYS}); using ${MAX_RELAYS}."
+    COUNT="$MAX_RELAYS"
+  fi
 fi
-INGRESS_CHOICE="${INGRESS:-tunnels}" # TryCloudflare is default for "just works" public access
+INGRESS_CHOICE="${INGRESS:-${DEPLOYED_INGRESS:-tunnels}}" # TryCloudflare is default for "just works" public access
+
+PROMPT_MAX="$MAX_RELAYS"
+if [ "$COUNT" -gt "$PROMPT_MAX" ]; then
+  PROMPT_MAX="$COUNT"
+fi
 
 if [ "$AUTO_YES" = true ]; then
-  log_info "Non-interactive mode (-y): using recommended count = ${COUNT} relays."
-  log_info "Ingress method: TryCloudflare Quick Tunnels (public HTTPS URLs)."
+  log_info "Non-interactive mode (-y): using count = ${COUNT} relays."
+  case "$INGRESS_CHOICE" in
+    1|tailscale) log_info "Ingress method: Mesh-VPN direct (router bind resolved at generation)." ;;
+    *) log_info "Ingress method: TryCloudflare Quick Tunnels (public HTTPS URLs)." ;;
+  esac
 else
-  printf "How many relays do you want to create? [1-%s, default: %s]: " "$MAX_RELAYS" "$COUNT"
+  printf "How many relays do you want to create? [1-%s, default: %s]: " "$PROMPT_MAX" "$COUNT"
   read -r user_count || true
   if [ -n "$user_count" ]; then
     COUNT="$user_count"
+    COUNT_FROM_DEPLOY=0
   fi
 
   echo ""
   echo "--- Choose Ingress Exposure ---"
+  DEFAULT_INGRESS_NUM=1
+  case "$INGRESS_CHOICE" in
+    2|tailscale) DEFAULT_INGRESS_NUM=2 ;;
+  esac
   if [ "$TAILSCALE_DETECTED" = true ]; then
     echo "  1) TryCloudflare Quick Tunnels (Recommended: public HTTPS, zero client VPN needed)"
     echo "  2) Tailscale Mesh-VPN Direct (Private static URL via ${TS_IP})"
-    printf "Choose ingress method [1/2, default: 1]: "
+    printf "Choose ingress method [1/2, default: %s]: " "$DEFAULT_INGRESS_NUM"
     read -r user_ingress || true
-    if [ "$user_ingress" = "2" ]; then
-      INGRESS_CHOICE="tailscale"
-    else
-      INGRESS_CHOICE="tunnels"
+    if [ -n "$user_ingress" ]; then
+      case "$user_ingress" in
+        2) INGRESS_CHOICE="tailscale" ;;
+        1) INGRESS_CHOICE="tunnels" ;;
+      esac
     fi
   else
     echo "  1) TryCloudflare Quick Tunnels (Recommended: public HTTPS, zero client configuration)"
     echo "  2) Tailscale Mesh-VPN Direct (requires Tailscale on VPS + local machine)"
-    printf "Choose ingress method [1/2, default: 1]: "
+    printf "Choose ingress method [1/2, default: %s]: " "$DEFAULT_INGRESS_NUM"
     read -r user_ingress || true
-    if [ "$user_ingress" = "2" ]; then
-      INGRESS_CHOICE="tailscale"
-    else
-      INGRESS_CHOICE="tunnels"
+    if [ -n "$user_ingress" ]; then
+      case "$user_ingress" in
+        2) INGRESS_CHOICE="tailscale" ;;
+        1) INGRESS_CHOICE="tunnels" ;;
+      esac
     fi
   fi
 fi
@@ -325,8 +414,12 @@ case "$COUNT" in
     ;;
 esac
 if [ "$COUNT" -gt "$MAX_RELAYS" ]; then
-  log_warn "COUNT=${COUNT} exceeds the safe maximum for this VPS (${MAX_RELAYS}); using ${MAX_RELAYS}."
-  COUNT="$MAX_RELAYS"
+  if [ "$COUNT_FROM_DEPLOY" -eq 1 ]; then
+    log_warn "Deployed count ${COUNT} is above the fresh-install recommendation (${MAX_RELAYS}); keeping it."
+  else
+    log_warn "COUNT=${COUNT} exceeds the safe maximum for this VPS (${MAX_RELAYS}); using ${MAX_RELAYS}."
+    COUNT="$MAX_RELAYS"
+  fi
 fi
 if [ "$COUNT" -lt 1 ]; then
   COUNT=1
@@ -359,7 +452,7 @@ log_info "Generating docker-compose.yml for ${COUNT} relays..."
 sh ./generate-compose.sh "$COUNT" $WITH_TUNNELS_FLAG
 
 log_info "Starting containers with Docker Compose..."
-$DOCKER_COMPOSE up -d --build
+$DOCKER_COMPOSE up -d --build --remove-orphans
 
 # -------------------------------------------------------------
 # 5. Wait for Readiness and Public URLs
@@ -395,11 +488,19 @@ fi
 # -------------------------------------------------------------
 # 6. Install Keep-Cold Auto-Rotation Service (Systemd)
 # -------------------------------------------------------------
-if [ -n "$NODE_BIN" ] && command -v systemctl >/dev/null 2>&1; then
+NODE_MAJOR=0
+if [ -n "$NODE_BIN" ]; then
+  NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+fi
+if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -lt 22 ]; then
+  log_warn "Node.js $("$NODE_BIN" -v) is older than 22; the prober needs >=22. Skipping the timers."
+fi
+
+if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 22 ] && command -v systemctl >/dev/null 2>&1; then
   SETUP_SYSTEMD=true
   if [ "$AUTO_YES" != true ]; then
     echo ""
-    printf "Enable keep-cold timer to auto-rotate rate-limited (429) relays? [Y/n]: "
+    printf "Enable keep-cold + logwatch timers to auto-rotate rate-limited (429) relays? [Y/n]: "
     read -r ans || true
     case "$ans" in
       [nN]*) SETUP_SYSTEMD=false ;;
@@ -408,12 +509,12 @@ if [ -n "$NODE_BIN" ] && command -v systemctl >/dev/null 2>&1; then
   fi
 
   if [ "$SETUP_SYSTEMD" = true ]; then
-    log_info "Configuring systemd keep-cold service and timer..."
+    log_info "Configuring systemd keep-cold and logwatch services..."
     CURRENT_USER="$(id -un)"
     CURRENT_GROUP="$(id -gn)"
     CURRENT_DIR="$(pwd)"
 
-    TMP_SERVICE="$(mktemp)"
+    TMP_KEEP="$(mktemp)"
     sed -e "s|^User=.*|User=${CURRENT_USER}|" \
         -e "s|^Group=.*|Group=${CURRENT_GROUP}|" \
         -e "s|^WorkingDirectory=.*|WorkingDirectory=${CURRENT_DIR}|" \
@@ -421,15 +522,29 @@ if [ -n "$NODE_BIN" ] && command -v systemctl >/dev/null 2>&1; then
         -e "s|^Environment=KEEP_COLD_LOG=.*|Environment=KEEP_COLD_LOG=${CURRENT_DIR}/keep-cold.log|" \
         -e "s|^Environment=COUNT=.*|Environment=COUNT=${COUNT}|" \
         -e "s|^Environment=BASE_PORT=.*|Environment=BASE_PORT=${BASE_PORT:-3000}|" \
-        -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n /tmp/warp-keep-cold.lock ${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --once|" \
-        systemd/warp-keep-cold.service > "$TMP_SERVICE"
+        -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock ${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --once|" \
+        systemd/warp-keep-cold.service > "$TMP_KEEP"
 
-    run_elevated cp "$TMP_SERVICE" /etc/systemd/system/warp-keep-cold.service
-    run_elevated cp systemd/warp-keep-cold.timer /etc/systemd/system/warp-keep-cold.timer
-    run_elevated systemctl daemon-reload
-    run_elevated systemctl enable --now warp-keep-cold.timer
-    rm -f "$TMP_SERVICE"
-    log_ok "Keep-cold auto-rotation active: checks every 5 minutes."
+    TMP_WATCH="$(mktemp)"
+    sed -e "s|^User=.*|User=${CURRENT_USER}|" \
+        -e "s|^Group=.*|Group=${CURRENT_GROUP}|" \
+        -e "s|^WorkingDirectory=.*|WorkingDirectory=${CURRENT_DIR}|" \
+        -e "s|^Documentation=.*|Documentation=file:${CURRENT_DIR}/logwatch.sh|" \
+        -e "s|^Environment=COUNT=.*|Environment=COUNT=${COUNT}|" \
+        -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-logwatch.lock /bin/sh ${CURRENT_DIR}/logwatch.sh|" \
+        systemd/warp-logwatch.service > "$TMP_WATCH"
+
+    if run_elevated cp "$TMP_KEEP" /etc/systemd/system/warp-keep-cold.service \
+       && run_elevated cp systemd/warp-keep-cold.timer /etc/systemd/system/warp-keep-cold.timer \
+       && run_elevated cp "$TMP_WATCH" /etc/systemd/system/warp-logwatch.service \
+       && run_elevated cp systemd/warp-logwatch.timer /etc/systemd/system/warp-logwatch.timer \
+       && run_elevated systemctl daemon-reload \
+       && run_elevated systemctl enable --now warp-keep-cold.timer warp-logwatch.timer; then
+      log_ok "Keep-cold auto-rotation + logwatch active (5-minute timers)."
+    else
+      log_warn "systemd units were not installed; run 'node keep-cold.mjs --once' manually or re-run with sudo."
+    fi
+    rm -f "$TMP_KEEP" "$TMP_WATCH"
   fi
 fi
 

@@ -1,0 +1,17 @@
+# The relay image needs only package.json, package-lock.json and server.mjs.
+# Keep the whole checkout (including .env and WARP account material) out of
+# the build context.
+.git
+.github
+node_modules
+logs
+reference
+devdocs
+accounts
+.env
+.env.*
+*.log
+test
+docs
+systemd
+warp-lite

@@ -1,15 +1,23 @@
 {
-  "dependencies": {
-    "undici": "^7.4.0"
+  "name": "warp-relay",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Docker/WARP egress relay pool for pi-freeflow, OMP and Pi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trefeon/warp-relay-pool.git"
   },
+  "type": "module",
   "engines": {
     "node": ">=22"
   },
-  "name": "warp-relay",
   "scripts": {
+    "start": "node server.mjs",
     "probe": "node keep-cold.mjs",
-    "start": "node server.mjs"
+    "test": "node --test test/*.test.mjs && bash logwatch.test.sh"
   },
-  "type": "module",
-  "version": "1.0.0"
+  "dependencies": {
+    "undici": "^7.30.1"
+  }
 }

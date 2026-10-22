@@ -5,7 +5,7 @@ FROM alpine:3.21 AS microsocks-builder
 
 RUN apk add --no-cache build-base git
 
-ARG MICROSOCKS_REF=master
+ARG MICROSOCKS_REF=v1.0.5
 RUN git clone --depth 1 --branch "${MICROSOCKS_REF}" \
     https://github.com/rofl0r/microsocks.git /src \
     && make -C /src
@@ -40,5 +40,14 @@ RUN chmod +x entrypoint.sh \
 EXPOSE 1080/tcp
 # WireGuard profile persists here across restarts (tier-1/tier-2 rotation).
 VOLUME ["/etc/wireguard"]
+
+# microsocks is PID 1 and installs no SIGTERM handler, so PID 1 ignores it and
+# every `docker restart` waits the full 10s grace before SIGKILL.
+STOPSIGNAL SIGKILL
+
+# A stale handshake is this image's dominant failure mode ("running" but
+# blackholed). wg-quick refreshes latest-handshakes on every handshake.
+HEALTHCHECK --interval=60s --timeout=10s --start-period=180s --retries=3 \
+    CMD sh -c 'now=$(date +%s); h=$(wg show wg0 latest-handshakes 2>/dev/null | head -n1 | cut -f2); [ -n "$h" ] && [ "$h" -gt 0 ] && [ $((now-h)) -lt 300 ]'
 
 CMD ["./entrypoint.sh"]

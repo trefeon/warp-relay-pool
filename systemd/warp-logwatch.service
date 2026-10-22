@@ -19,6 +19,12 @@ Type=oneshot
 User=warp-relay
 Group=warp-relay
 WorkingDirectory=/opt/warp-relay-pool
+# The watcher reads `docker logs` and `journalctl -u warp-keep-cold.service`.
+# systemd applies the user's groups, but a hand-install may use a user that is
+# only in one of them; grant both explicitly.
+SupplementaryGroups=docker systemd-journal
+# Pool size: must match the deployed relay count (setup.sh rewrites this line).
+Environment=COUNT=10
 # A scrape is seconds of docker/journal reads; 5 min is ample headroom.
 TimeoutStartSec=300
 ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-logwatch.lock /bin/sh /opt/warp-relay-pool/logwatch.sh

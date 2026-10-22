@@ -18,10 +18,14 @@ Type=oneshot
 # Edit to the user that owns the checkout (required for system units).
 User=warp-relay
 Group=warp-relay
+# keep-cold shells out to `docker restart` for every rotation; a hand-install
+# user that is not in the docker group would fail every tier-1 silently.
+SupplementaryGroups=docker
 WorkingDirectory=/opt/warp-relay-pool
-# A pass can rotate several relays, and each rotation waits for the WARP client
-# to re-handshake, so this must be well above the default 90s oneshot timeout.
-TimeoutStartSec=900
+# A pass can rotate several relays; each rotation waits up to READY_TIMEOUT_MS
+# (180s) per tier-1 attempt, plus probes. At the default ROTATE_CONCURRENCY=1
+# and MAX_ROTATIONS=4, two hot relays already exceed 15 minutes.
+TimeoutStartSec=3600
 # The script rotates its own log, so no shell wrapper is needed here.
 # Adjust the path below to where you cloned this repo.
 Environment=KEEP_COLD_LOG=/opt/warp-relay-pool/keep-cold.log
@@ -32,6 +36,8 @@ Environment=COUNT=10
 # Base port of the relay listeners (relay N listens on BASE_PORT+N). Must
 # match the generated compose; the wizard rewrites it from .env/default.
 Environment=BASE_PORT=3000
-ExecStart=/usr/bin/flock -n /tmp/warp-keep-cold.lock /usr/bin/node /opt/warp-relay-pool/keep-cold.mjs --once
+# -E 0: a skipped pass (timer fires while the previous one is still running)
+# is contention, not failure; the pass result stays in the journal.
+ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock /usr/bin/node /opt/warp-relay-pool/keep-cold.mjs --once
 StandardOutput=journal
 StandardError=journal

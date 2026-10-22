@@ -21,8 +21,9 @@ TAILSCALE_CIDR="${TAILSCALE_CIDR:-100.64.0.0/10}"
 TAILSCALE_CIDR_V6="${TAILSCALE_CIDR_V6:-fd7a:115c:a1e0::/48}"
 KEEPALIVE="${KEEPALIVE:-15}"
 ENDPOINT_IP="${ENDPOINT_IP:-}"
-# Fallback when GitHub API is unavailable or rate-limited.
-WGCF_FALLBACK_VER="${WGCF_FALLBACK_VER:-2.2.29}"
+# Pinned release; set WGCF_VERSION=latest to resolve from the GitHub API.
+WGCF_VERSION="${WGCF_VERSION:-2.3.1}"
+WGCF_FALLBACK_VER="${WGCF_FALLBACK_VER:-2.3.1}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-15}"
 # Keep egress probe short so it never delays SOCKS readiness.
 TRACE_TIMEOUT="${TRACE_TIMEOUT:-3}"
@@ -68,6 +69,14 @@ detect_arch() {
         aarch64|arm64) printf 'arm64' ;;
         *) die "unsupported architecture: $arch (supported: x86_64/amd64, aarch64/arm64)" ;;
     esac
+}
+
+resolve_wgcf_version() {
+    if [ "$WGCF_VERSION" != "latest" ]; then
+        printf '%s' "$WGCF_VERSION"
+        return 0
+    fi
+    fetch_latest_wgcf_version
 }
 
 fetch_latest_wgcf_version() {
@@ -117,7 +126,7 @@ extract_ipv6_cidr() {
     printf '%s' "$1" \
         | tr ',' '\n' \
         | tr ' ' '\n' \
-        | grep -E '^[0-9a-fA-F:]+/[0-9]{1,3}$' \
+        | grep -E '^[0-9a-fA-F:]+/(6[4-9]|[7-9][0-9]|1[0-2][0-8])$' \
         | grep -E ':' \
         | head -n 1
 }
@@ -174,7 +183,7 @@ register_warp() {
     log "no config found, registering Cloudflare WARP (WireGuard)..."
 
     arch="$(detect_arch)"
-    ver="$(fetch_latest_wgcf_version)"
+    ver="$(resolve_wgcf_version)"
     log "wgcf version: v${ver} (${arch})"
 
     url="https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
@@ -184,6 +193,18 @@ register_warp() {
 
     if ! download_file "$url" "$workdir/wgcf"; then
         die "wgcf download failed: $url"
+    fi
+
+    # Verify the release checksum before executing: the binary runs as root
+    # with NET_ADMIN privileges in every relay.
+    sums_url="https://github.com/ViRb3/wgcf/releases/download/v${ver}/checksums.txt"
+    if ! download_file "$sums_url" "$workdir/checksums.txt"; then
+        die "wgcf checksums download failed: $sums_url"
+    fi
+    expected="$(awk -v f="wgcf_${ver}_linux_${arch}" '$2 == f { print $1; exit }' "$workdir/checksums.txt")"
+    actual="$(sha256sum "$workdir/wgcf" | awk '{ print $1 }')"
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+        die "wgcf checksum mismatch (expected '${expected}', got '${actual}')"
     fi
     chmod +x "$workdir/wgcf"
 
@@ -492,7 +513,17 @@ install_policy_routes() {
         if ip -6 route replace ::/0 dev "$WG_IFACE" 2>/dev/null; then
             log "main-table v6 default now dev ${WG_IFACE}"
         else
-            warn "v6 default-via-tunnel install failed (v4 SOCKS still usable)"
+            # A native v6 default would leak egress from the container address
+            # while SOCKS reports success (microsocks resolves AAAA too).
+            die "main-table v6 default-via-tunnel install failed; refusing to leak IPv6 egress"
+        fi
+    else
+        # IPv6 is not tunneled: blackhole it so AAAA targets cannot leave via
+        # the container's own address. More-specific mesh routes still win.
+        if ip -6 route replace blackhole ::/0 2>/dev/null; then
+            log "IPv6 egress blackholed (not tunneled)"
+        else
+            warn "could not install IPv6 blackhole route"
         fi
     fi
 

@@ -232,8 +232,12 @@ run_watch 1
 expect_eq "overlap: only the new line appended" \
   "$(wc -l < "$LOGS/errors.log")" "$((lines1 + 1))"
 expect_contains "overlap: new line present" "$LOGS/errors.log" "third timeout"
-expect_eq "overlap: cursor advanced forward" \
-  "$(test "$(cat "$LOGS/.cursor")" -ge 0 && echo yes)" "yes"
+cursor_state="$(cat "$LOGS/.cursor" 2>/dev/null || true)"
+case "$cursor_state" in
+  ''|*[!0-9]*) cursor_ok=no ;;
+  *) cursor_ok=yes ;;
+esac
+expect_eq "overlap: cursor holds an epoch timestamp" "$cursor_ok" "yes"
 drop_sandbox
 
 # --- 11. rotation at exactly MAX_BYTES ------------------------------------

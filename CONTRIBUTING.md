@@ -32,14 +32,21 @@ Run before opening a PR:
 ```sh
 node --check server.mjs
 node --check keep-cold.mjs
-sh -n generate-compose.sh setup.sh get-status.sh logwatch.sh warp-lite/entrypoint.sh
+for f in generate-compose.sh setup.sh get-status.sh logwatch.sh \
+         logwatch.test.sh warp-lite/entrypoint.sh; do
+  sh -n "$f"          # `sh -n a b c` would parse only the first file
+done
+npm ci --no-audit --no-fund
 bash logwatch.test.sh
 node --test test/*.test.mjs
-docker compose config
+sh ./generate-compose.sh 10
+git diff --exit-code docker-compose.yml
+docker compose config -q
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same gates plus a regeneration
-determinism check on `docker-compose.yml`.
+CI (`.github/workflows/ci.yml`) runs the same gates plus ShellCheck, a
+`warp-lite` image build, and a gitleaks scan. Commit `package-lock.json`
+whenever `package.json` changes — CI uses `npm ci`.
 
 ## Style
 

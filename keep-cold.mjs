@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * keep-cold-lite.mjs — MicroWARP port of keep-cold.mjs (copy + 4 deltas, 2026-10-05; serverError class 2026-10-05).
+ * keep-cold.mjs — MicroWARP egress prober/rotator (serverError class 2026-10-05).
  *
  * Every relay in this pool reaches the upstream through its own Cloudflare WARP
  * client container, so each has its own egress IPv6 address. Cloudflare recycles
@@ -80,9 +80,9 @@
  *                       dots-studio/dots-3-note-preview:free; everything
  *                       else probes via PROBE_CHAT_PATH)
  *   GLOBAL_QUOTA_GUARD  relays-429ed threshold at which a model counts as
- *                       upstream quota, not egress throttle (default 5;
- *                       capped at COUNT). Quota-capped models are skipped
- *                       for rotation this pass.
+ *                       upstream quota, not egress throttle (default
+ *                       max(8, COUNT-1), capped at COUNT). Quota-capped
+ *                       models are skipped for rotation this pass.
  *   SERVER_ERROR_RETRY    same-egress re-probes before a server_error
  *                       rotation (default 1 — stateless transient filter)
  *   SERVER_ERROR_REPROBE_MS  delay before each re-probe (default 5000)
@@ -101,30 +101,109 @@
  *   CONTAINER_PREFIX    docker container prefix       (default warp-relay-warp-)
  *   READY_TIMEOUT_MS    wait for a rotated relay      (default 180000)
  *   PROBE_TIMEOUT_MS    per-probe request timeout     (default 30000)
- *   MAX_ROTATIONS       restarts per relay per pass   (default 4)
- *   ROTATE_CONCURRENCY  parallel restarts             (default 3)
+ *   MAX_ROTATIONS       tier-1 restarts per relay per pass (default 4;
+ *                       tier 2 runs at most once per relay per pass)
+ *   TIER2_MIN_INTERVAL_S  minimum seconds between tier-2 re-keys for one
+ *                       relay, persisted in TIER2_STATE_FILE (default 3600)
+ *   ROTATE_CONCURRENCY  parallel restarts             (default 1)
  *   INTERVAL_S          seconds between loop passes   (default 300)
+ *   SOCKS_PORT_BASE     host SOCKS port for relay N   (default 10800)
  *   KEEP_COLD_LOG       append the log to this file   (default stdout only)
  *   KEEP_COLD_LOG_MAX_BYTES  rotate above this size    (default 2 MiB)
  *   KEEP_COLD_LOG_KEEP_BYTES keep this much on rotate   (default 200 KiB)
  */
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+const USAGE = `Usage: node keep-cold.mjs [--once|--loop] [--help]
+
+  --once   single pass (the default; what the systemd timer runs)
+  --loop   pass every INTERVAL_S seconds (foreground)
+  --help   print this text and exit`;
+
+const argv = process.argv.slice(2);
+const unknownArgs = argv.filter((a) => !["--once", "--loop", "--help", "-h"].includes(a));
+if (unknownArgs.length) {
+ console.error(`keep-cold: unknown argument(s): ${unknownArgs.join(" ")}`);
+ console.error(USAGE);
+ process.exit(2);
+}
+if (argv.includes("--help") || argv.includes("-h")) {
+ console.log(USAGE);
+ process.exit(0);
+}
+const LOOP = argv.includes("--loop");
+if (LOOP && argv.includes("--once")) {
+ console.error("keep-cold: --once and --loop are mutually exclusive");
+ process.exit(2);
+}
+
+/**
+ * Parse an integer env var, failing fast on blank/garbage values. A silent
+ * fallback here used to turn a pass into a no-op that still exited 0.
+ */
+function envInt(name, dflt, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+ const raw = process.env[name];
+ if (raw === undefined) return dflt;
+ if (raw.trim() === "") {
+  console.error(`keep-cold: ${name} is set but blank`);
+  process.exit(2);
+ }
+ if (!/^-?\d+$/.test(raw.trim())) {
+  console.error(`keep-cold: ${name}='${raw}' must be an integer`);
+  process.exit(2);
+ }
+ const n = Number(raw.trim());
+ if (!Number.isSafeInteger(n) || n < min || n > max) {
+  console.error(`keep-cold: ${name}='${raw}' must be an integer in ${min}..${max}`);
+  process.exit(2);
+ }
+ return n;
+}
+
+function envPath(name, dflt) {
+ const value = process.env[name] ?? dflt;
+ if (!value.startsWith("/")) {
+  console.error(`keep-cold: ${name}='${value}' must be a rooted path`);
+  process.exit(2);
+ }
+ return value;
+}
+
+function envUrl(name, dflt) {
+ const value = (process.env[name] ?? dflt).replace(/\/+$/, "");
+ try {
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("not http(s)");
+ } catch {
+  console.error(`keep-cold: ${name}='${value}' is not a valid http(s) URL`);
+  process.exit(2);
+ }
+ return value;
+}
 
 const RELAY_HOST = process.env.RELAY_HOST ?? "10.244.0.100";
 const SOCKS_HOST = process.env.SOCKS_HOST ?? "127.0.0.1";
-const BASE_PORT = Number(process.env.BASE_PORT ?? 3000);
-const COUNT = Number(process.env.COUNT ?? 10);
-const PROBE_TARGET = process.env.PROBE_TARGET ?? "https://api.kilo.ai";
-const PROBE_CHAT_PATH = process.env.PROBE_CHAT_PATH ?? "/api/gateway/chat/completions";
-const PROBE_RESPONSES_PATH = process.env.PROBE_RESPONSES_PATH ?? "/api/gateway/responses";
+const BASE_PORT = envInt("BASE_PORT", 3000, { max: 65535 });
+const COUNT = envInt("COUNT", 10, { min: 1, max: 64 });
+const SOCKS_PORT_BASE = envInt("SOCKS_PORT_BASE", 10800, { min: 1, max: 65535 });
+const PROBE_TARGET = envUrl("PROBE_TARGET", "https://api.kilo.ai");
+const PROBE_CHAT_PATH = envPath("PROBE_CHAT_PATH", "/api/gateway/chat/completions");
+const PROBE_RESPONSES_PATH = envPath("PROBE_RESPONSES_PATH", "/api/gateway/responses");
 const PROBE_MODELS = (process.env.PROBE_MODELS
  ?? process.env.PROBE_MODEL
  ?? "nvidia/nemotron-3.5-lightning:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free")
  .split(",")
  .map((s) => s.trim())
  .filter(Boolean);
+if (PROBE_MODELS.length === 0) {
+ console.error("keep-cold: PROBE_MODELS is empty — nothing to probe");
+ process.exit(2);
+}
 const RESPONSES_MODELS = new Set(
  (process.env.RESPONSES_MODELS
   ?? "dots-studio/dots-3-note-preview:free")
@@ -132,20 +211,21 @@ const RESPONSES_MODELS = new Set(
   .map((s) => s.trim())
   .filter(Boolean),
 );
-const GLOBAL_QUOTA_GUARD = Math.min(Number(process.env.GLOBAL_QUOTA_GUARD ?? Math.max(8, COUNT - 1)), COUNT);
+const GLOBAL_QUOTA_GUARD = Math.min(envInt("GLOBAL_QUOTA_GUARD", Math.max(8, COUNT - 1), { min: 1 }), COUNT);
 const SPEED_MODEL = process.env.SPEED_MODEL ?? "nvidia/nemotron-3.5-lightning:free";
-const SLOW_THRESHOLD_MS = Number(process.env.SLOW_THRESHOLD_MS ?? 0);
-const SLOW_MAX_ROTATIONS = Number(process.env.SLOW_MAX_ROTATIONS ?? 2);
+const SLOW_THRESHOLD_MS = envInt("SLOW_THRESHOLD_MS", 0);
+const SLOW_MAX_ROTATIONS = envInt("SLOW_MAX_ROTATIONS", 2);
 const CONTAINER_PREFIX = process.env.CONTAINER_PREFIX ?? "warp-relay-warp-";
-const READY_TIMEOUT_MS = Number(process.env.READY_TIMEOUT_MS ?? 180_000);
-const PROBE_TIMEOUT_MS = Number(process.env.PROBE_TIMEOUT_MS ?? 30_000);
-const MAX_ROTATIONS = Number(process.env.MAX_ROTATIONS ?? 4);
-const ROTATE_CONCURRENCY = Number(process.env.ROTATE_CONCURRENCY ?? 1);
-const SERVER_ERROR_RETRY = Number(process.env.SERVER_ERROR_RETRY ?? 1);
-const SERVER_ERROR_REPROBE_MS = Number(process.env.SERVER_ERROR_REPROBE_MS ?? 5_000);
-const SERVER_ERROR_GUARD = Math.min(Number(process.env.SERVER_ERROR_GUARD ?? 9), COUNT);
-const INTERVAL_S = Number(process.env.INTERVAL_S ?? 300);
-const LOOP = process.argv.includes("--loop");
+const READY_TIMEOUT_MS = envInt("READY_TIMEOUT_MS", 180_000, { min: 1 });
+const PROBE_TIMEOUT_MS = envInt("PROBE_TIMEOUT_MS", 30_000, { min: 1 });
+const MAX_ROTATIONS = envInt("MAX_ROTATIONS", 4, { min: 1 });
+const ROTATE_CONCURRENCY = envInt("ROTATE_CONCURRENCY", 1, { min: 1, max: 64 });
+const SERVER_ERROR_RETRY = envInt("SERVER_ERROR_RETRY", 1);
+const SERVER_ERROR_REPROBE_MS = envInt("SERVER_ERROR_REPROBE_MS", 5_000);
+const SERVER_ERROR_GUARD = Math.min(envInt("SERVER_ERROR_GUARD", 9, { min: 1 }), COUNT);
+const INTERVAL_S = envInt("INTERVAL_S", 300, { min: 1 });
+const TIER2_MIN_INTERVAL_S = envInt("TIER2_MIN_INTERVAL_S", 3600);
+const TIER2_STATE_FILE = process.env.TIER2_STATE_FILE ?? ".keep-cold/tier2-state.json";
 
 // ── Upstream fingerprint ────────────────────────────────────────────
 // Historically OpenCode's free tier rejected requests that did not look like
@@ -227,15 +307,26 @@ function probeHeaders(relayPath) {
 
 // ── Logging ─────────────────────────────────────────────────────────
 const LOG_PATH = process.env.KEEP_COLD_LOG ?? "";
-const LOG_MAX_BYTES = Number(process.env.KEEP_COLD_LOG_MAX_BYTES ?? 2 * 1024 * 1024);
-const LOG_KEEP_BYTES = Number(process.env.KEEP_COLD_LOG_KEEP_BYTES ?? 200 * 1024);
+const LOG_MAX_BYTES = envInt("KEEP_COLD_LOG_MAX_BYTES", 2 * 1024 * 1024, { min: 1 });
+const LOG_KEEP_BYTES = envInt("KEEP_COLD_LOG_KEEP_BYTES", 200 * 1024, { min: 1 });
+if (LOG_KEEP_BYTES >= LOG_MAX_BYTES) {
+ console.error("keep-cold: KEEP_COLD_LOG_KEEP_BYTES must be smaller than KEEP_COLD_LOG_MAX_BYTES");
+ process.exit(2);
+}
 
-/** Trim the log in place once it passes the cap, keeping the newest slice. */
+/** Trim the log once it passes the cap, keeping the newest whole lines. */
 function rotateLogIfNeeded() {
  try {
   if (fs.statSync(LOG_PATH).size <= LOG_MAX_BYTES) return;
   const buf = fs.readFileSync(LOG_PATH);
-  fs.writeFileSync(LOG_PATH, buf.subarray(Math.max(0, buf.length - LOG_KEEP_BYTES)));
+  const tail = buf.subarray(Math.max(0, buf.length - LOG_KEEP_BYTES));
+  const nl = tail.indexOf(0x0a);
+  const kept = nl >= 0 ? tail.subarray(nl + 1) : tail;
+  // temp+rename: a kill mid-rotation must not lose the whole log, and a
+  // concurrent manual run must not interleave with a truncate-then-write.
+  const tmp = `${LOG_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, kept);
+  fs.renameSync(tmp, LOG_PATH);
  } catch {
   // Missing log file — nothing to rotate.
  }
@@ -259,32 +350,41 @@ function containerName(index) {
  return `${CONTAINER_PREFIX}${index}`;
 }
 
-function docker(args, timeout = 30_000) {
- return execFileSync("docker", args, {
+async function docker(args, timeout = 30_000) {
+ const { stdout } = await execFileAsync("docker", args, {
   encoding: "utf8",
-  stdio: ["ignore", "pipe", "pipe"],
   timeout,
+  maxBuffer: 4 * 1024 * 1024,
  });
+ return stdout;
 }
 
 /** True when the WARP client egresses with WARP on (host-side SOCKS check). */
-function warpReady(index) {
+async function warpReady(index) {
  try {
   // MicroWARP has no warp-cli and no guaranteed curl — check from the deploy
   // host via SOCKS instead of docker-exec.
-  const trace = execFileSync("curl", ["-s", "-m", "10", "-x", `socks5h://${SOCKS_HOST}:${10800 + index}`, "https://cloudflare.com/cdn-cgi/trace"], { encoding: "utf8", timeout: 15_000 });
-  return /^ip=/m.test(trace) && /warp=on/m.test(trace);
+  const { stdout } = await execFileAsync(
+   "curl",
+   ["-s", "-m", "10", "-x", `socks5h://${SOCKS_HOST}:${SOCKS_PORT_BASE + index}`, "https://cloudflare.com/cdn-cgi/trace"],
+   { encoding: "utf8", timeout: 15_000 },
+  );
+  return /^ip=/m.test(stdout) && /warp=on/m.test(stdout);
  } catch {
   return false;
  }
 }
 
 /** Egress address of a relay, for the log line. */
-function egressIp(index) {
+async function egressIp(index) {
  try {
   // MicroWARP has no docker-exec curl — probe from the deploy host via SOCKS.
-  const trace = execFileSync("curl", ["-s", "-m", "10", "-x", `socks5h://${SOCKS_HOST}:${10800 + index}`, "https://cloudflare.com/cdn-cgi/trace"], { encoding: "utf8", timeout: 15_000 });
-  return (trace.match(/^ip=(.+)$/m)?.[1] ?? "?").trim();
+  const { stdout } = await execFileAsync(
+   "curl",
+   ["-s", "-m", "10", "-x", `socks5h://${SOCKS_HOST}:${SOCKS_PORT_BASE + index}`, "https://cloudflare.com/cdn-cgi/trace"],
+   { encoding: "utf8", timeout: 15_000 },
+  );
+  return (stdout.match(/^ip=(.+)$/m)?.[1] ?? "?").trim();
  } catch {
   return "?";
  }
@@ -292,7 +392,7 @@ function egressIp(index) {
 
 async function waitReady(index, deadline) {
  while (Date.now() < deadline) {
-  if (warpReady(index)) return true;
+  if (await warpReady(index)) return true;
   await new Promise((r) => setTimeout(r, 4_000));
  }
  return false;
@@ -346,7 +446,14 @@ async function probe(index, model) {
    signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
   });
   if (res.status === 200) {
-   const head = await readEnvelopeHead(res).catch(() => "");
+   // A body that dies mid-read is a wedged egress, not a clean probe: the
+   // old `.catch(() => "")` silently turned it into a 200.
+   let head;
+   try {
+    head = await readEnvelopeHead(res);
+   } catch (e) {
+    return { index, model, status: 0, serverError: false, detail: `body read failed: ${String(e?.message ?? e)}`.slice(0, 160), ms: Date.now() - t0 };
+   }
    const ms = Date.now() - t0;
    if (SERVER_ERROR_RE.test(head)) {
     const evt = /response\.failed/i.test(head) ? "response.failed" : /failed to generate/i.test(head) ? "failed to generate" : "server_error";
@@ -369,21 +476,55 @@ async function probeRelay(index, models = PROBE_MODELS) {
  return out;
 }
 
+// Tier-2 spends a Cloudflare registration. One per relay per pass is the
+// budget; the state file keeps a stuck relay from re-spending it on every
+// 5-minute timer tick.
+function loadTier2State() {
+ try {
+  return JSON.parse(fs.readFileSync(TIER2_STATE_FILE, "utf8")) ?? {};
+ } catch {
+  return {};
+ }
+}
+
+function saveTier2State(index, stamp) {
+ try {
+  fs.mkdirSync(path.dirname(TIER2_STATE_FILE), { recursive: true });
+  // Concurrent rotations each hold a snapshot from pass start; merge against
+  // the current file so a slow writer cannot erase another relay's stamp.
+  const merged = { ...loadTier2State(), [index]: stamp };
+  const tmp = `${TIER2_STATE_FILE}.${process.pid}.${index}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(merged));
+  fs.renameSync(tmp, TIER2_STATE_FILE);
+ } catch {
+  // State is an optimization; never fail a pass over it.
+ }
+}
+
+function tier2Allowed(index, state) {
+ if (TIER2_MIN_INTERVAL_S === 0) return true;
+ return Date.now() - Number(state[index] ?? 0) >= TIER2_MIN_INTERVAL_S * 1000;
+}
+
 /**
  * Restart the WARP client container until every given model answers 200
  * (and, when `speed` is set, the speed model answers within threshold).
  * 429 path uses MAX_ROTATIONS; speed-only retries use SLOW_MAX_ROTATIONS.
- * Two-tier per attempt: tier 1 (t1) plain restart, tier 2 (t2) exec-wipe of
- * wg0.conf + restart. Nodes without wg0.conf skip tier 2 (abort, no wipe).
+ * Two-tier: tier 1 (t1) plain restart, tier 2 (t2) exec-wipe of wg0.conf +
+ * restart at most once per relay per pass (and not again for
+ * TIER2_MIN_INTERVAL_S). Nodes without wg0.conf skip tier 2.
  */
 async function rotateUntilClean(index, models, speed = null) {
  const maxAttempts = speed ? SLOW_MAX_ROTATIONS : MAX_ROTATIONS;
+ const tier2State = loadTier2State();
+ let rekeys = 0;
+ let latestFailing = null;
  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
   log(`#${index} rotating egress (attempt ${attempt}/${maxAttempts} t1) — restarting ${containerName(index)}`);
   try {
    // Tier 1: plain restart - same account, fresh egress /64. Cheap, zero
    // registration-quota cost; clears per-egress-IP throttles.
-   docker(["restart", containerName(index)], 60_000);
+   await docker(["restart", containerName(index)], 60_000);
   } catch (e) {
    log(`#${index} restart failed: ${String(e?.message ?? e).slice(0, 120)}`);
    continue;
@@ -395,27 +536,43 @@ async function rotateUntilClean(index, models, speed = null) {
   }
   const results = await probeRelay(index, models);
   const failing = results.filter((r) => r.status !== 200 || r.serverError);
+  latestFailing = failing;
   if (failing.length === 0) {
    if (speed) {
     const t = results.find((r) => r.model === speed.model)?.ms ?? Infinity;
     if (t <= speed.threshold) {
-     log(`#${index} fast on ${models.length} model(s) (${speed.model} ${t}ms) — new egress ${egressIp(index)}`);
+     log(`#${index} fast on ${models.length} model(s) (${speed.model} ${t}ms) — new egress ${await egressIp(index)}`);
      return true;
     }
     log(`#${index} still slow after rotation: ${speed.model} ${t}ms > ${speed.threshold}ms`);
     continue;
    }
-   log(`#${index} clean on ${models.length} model(s) — new egress ${egressIp(index)}`);
+   log(`#${index} clean on ${models.length} model(s) — new egress ${await egressIp(index)}`);
    return true;
   }
   // Tier 2: tier 1 did not clear it - re-key with a fresh registration (new
   // account/keys). Spends one Cloudflare registration; clears per-account
   // throttles. Nodes without wg0.conf (e.g. caomingjun) are not re-keyable:
   // abort the re-key instead of forcing a wipe.
+  if (rekeys >= 1) {
+   log(`#${index} tier-2 budget spent this pass — holding for the next pass`);
+   latestFailing = failing;
+   continue;
+  }
+  if (!tier2Allowed(index, tier2State)) {
+   const nextIn = Math.max(0, Math.ceil((TIER2_MIN_INTERVAL_S * 1000 - (Date.now() - Number(tier2State[index] ?? 0))) / 1000));
+   log(`#${index} tier-2 re-key deferred (last re-key < ${TIER2_MIN_INTERVAL_S}s ago; next in ~${nextIn}s)`);
+   latestFailing = failing;
+   continue;
+  }
+  rekeys++;
+  const tier2Stamp = Date.now();
+  tier2State[index] = tier2Stamp;
+  saveTier2State(index, tier2Stamp);
   log(`#${index} rotating egress (attempt ${attempt}/${maxAttempts} t2) — re-keying ${containerName(index)}`);
   let rekeyable = true;
   try {
-   docker(["exec", containerName(index), "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+   await docker(["exec", containerName(index), "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
   } catch {
    rekeyable = false;
   }
@@ -423,8 +580,8 @@ async function rotateUntilClean(index, models, speed = null) {
    log(`#${index} tier-2 aborted: no /etc/wireguard/wg0.conf — leaving registration untouched`);
   } else {
    try {
-    docker(["exec", containerName(index), "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
-    docker(["restart", containerName(index)], 60_000);
+    await docker(["exec", containerName(index), "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+    await docker(["restart", containerName(index)], 60_000);
    } catch (e) {
     log(`#${index} restart failed: ${String(e?.message ?? e).slice(0, 120)}`);
     continue;
@@ -436,21 +593,22 @@ async function rotateUntilClean(index, models, speed = null) {
    }
    const results2 = await probeRelay(index, models);
    const failing2 = results2.filter((r) => r.status !== 200 || r.serverError);
+   latestFailing = failing2;
    if (failing2.length === 0) {
     if (speed) {
      const t2 = results2.find((r) => r.model === speed.model)?.ms ?? Infinity;
      if (t2 <= speed.threshold) {
-      log(`#${index} fast on ${models.length} model(s) (${speed.model} ${t2}ms) — new egress ${egressIp(index)}`);
+      log(`#${index} fast on ${models.length} model(s) (${speed.model} ${t2}ms) — new egress ${await egressIp(index)}`);
       return true;
      }
      log(`#${index} still slow after rotation: ${speed.model} ${t2}ms > ${speed.threshold}ms`);
      continue;
     }
-    log(`#${index} clean on ${models.length} model(s) — new egress ${egressIp(index)}`);
+    log(`#${index} clean on ${models.length} model(s) — new egress ${await egressIp(index)}`);
     return true;
    }
   }
-  log(`#${index} still failing after rotation: ${failing.map((r) => `${r.model}=${r.status || "unreachable"}`).join(", ")}`);
+  log(`#${index} still failing after rotation: ${(latestFailing ?? failing).map((r) => `${r.model}=${r.status || "unreachable"}`).join(", ")}`);
  }
  log(`#${index} GAVE UP after ${maxAttempts} rotations`);
  return false;
@@ -465,7 +623,7 @@ async function rotateUntilClean(index, models, speed = null) {
 async function rotateTier1Once(index, models) {
  log(`#${index} rotating egress (t1 server_error) — restarting ${containerName(index)}`);
  try {
-  docker(["restart", containerName(index)], 60_000);
+  await docker(["restart", containerName(index)], 60_000);
  } catch (e) {
   log(`#${index} restart failed: ${String(e?.message ?? e).slice(0, 120)}`);
   return false;
@@ -478,7 +636,7 @@ async function rotateTier1Once(index, models) {
  const results = await probeRelay(index, models);
  const failing = results.filter((r) => r.status !== 200 || r.serverError);
  if (failing.length === 0) {
-  log(`#${index} clean on ${models.length} model(s) — new egress ${egressIp(index)}`);
+  log(`#${index} clean on ${models.length} model(s) — new egress ${await egressIp(index)}`);
   return true;
  }
  log(`#${index} still failing after t1: ${failing.map((r) => `${r.model}=${r.serverError ? "server_error" : (r.status || "unreachable")}`).join(", ")}`);
@@ -612,14 +770,36 @@ async function pass() {
   }
  }
 
+ // Every relay with any non-200 model counts against the clean tally —
+ // including relays whose only failure is a quota-capped model, which the
+ // rotation path deliberately leaves alone. Reporting them as clean is how a
+ // fully throttled pool used to log `clean N/N` and exit 0.
+ const badRelays = new Set([
+  ...hot.keys(),
+  ...serverErr.keys(),
+  ...troubled.map((r) => r.index),
+  ...cappedOnly,
+ ]);
  const hotDesc = [...hot.entries()].map(([i, ms]) => `#${i}(${ms.join(",")})`).join(" ");
  const serverErrDesc = [...serverErr.entries()].map(([i, rs]) => `#${i}(${rs.map((r) => r.model).join(",")})`).join(" ");
- log(`clean ${COUNT - new Set([...hot.keys(), ...serverErr.keys(), ...troubled.map((r) => r.index)]).size}/${COUNT} relay(s)` + (hot.size ? ` | throttled: ${hotDesc}` : "") + (serverErr.size ? ` | server_error: ${serverErrDesc}` : ""));
+ const cappedDesc = cappedOnly.length ? ` | quota-capped: ${cappedOnly.map((i) => `#${i}`).join(" ")}` : "";
+ log(`clean ${COUNT - badRelays.size}/${COUNT} relay(s)` + (hot.size ? ` | throttled: ${hotDesc}` : "") + (serverErr.size ? ` | server_error: ${serverErrDesc}` : "") + cappedDesc);
  for (const r of troubled) log(`#${r.index} ${r.model} unexpected HTTP ${r.status || "unreachable"} — ${r.detail}`);
 
- if (hot.size === 0 && slow.size === 0 && serverErr.size === 0) {
-  log("pool is cold");
-  return troubled.length === 0;
+ // 502 means the relay app is up but its upstream path failed — a dead WARP
+ // tunnel that `restart: always` will never notice. Give it one t1 attempt.
+ // Status 0 (host cannot reach the relay) stays operator-only.
+ const badGateway = new Map();
+ for (const r of troubled) {
+  if (r.status !== 502) continue;
+  if (!badGateway.has(r.index)) badGateway.set(r.index, []);
+  badGateway.get(r.index).push(r.model);
+ }
+
+ if (hot.size === 0 && slow.size === 0 && serverErr.size === 0 && badGateway.size === 0) {
+  if (cappedOnly.length) log(`pool is not cold: throttled on quota-capped model(s) only — nothing rotatable this pass`);
+  else log("pool is cold");
+  return troubled.length === 0 && cappedOnly.length === 0;
  }
 
  // server_error phase runs before the 429 path: cheap same-egress re-probes
@@ -637,6 +817,23 @@ async function pass() {
  }
 
  let allRecovered = true;
+ let troubledLeft = [...troubled];
+
+ if (badGateway.size) {
+  await runPool([...badGateway.keys()], ROTATE_CONCURRENCY, async (index) => {
+   const badGatewayModels = badGateway.get(index);
+   const recovered = await rotateTier1Once(index, badGatewayModels);
+   // Only the models this rotation re-probed are proven clean. Dropping the
+   // whole relay index would hide a sibling model's 500/transport failure and
+   // let the pass exit 0 on a still-broken relay.
+   if (recovered) {
+    troubledLeft = troubledLeft.filter((r) => !(r.index === index && badGatewayModels.includes(r.model)));
+   } else {
+    allRecovered = false;
+   }
+  });
+ }
+
  await runPool([...hot.keys()], ROTATE_CONCURRENCY, async (index) => {
   const recovered = await rotateUntilClean(index, rotatable);
   if (!recovered) allRecovered = false;
@@ -646,21 +843,24 @@ async function pass() {
   const recovered = await rotateUntilClean(index, rotatable, speedSpec);
   if (!recovered) allRecovered = false;
  });
- return allRecovered && troubled.length === 0 && serverHold.length === 0;
+ return allRecovered && troubledLeft.length === 0 && serverHold.length === 0 && cappedOnly.length === 0;
 }
 
 // ── Entry point ─────────────────────────────────────────────────────
 if (LOOP) {
  log(`loop mode: pass every ${INTERVAL_S}s (Ctrl-C to stop)`);
  for (; ;) {
+  const started = Date.now();
   try {
    await pass();
   } catch (e) {
    log(`pass failed: ${String(e?.message ?? e).slice(0, 200)}`);
   }
-  await new Promise((r) => setTimeout(r, INTERVAL_S * 1_000));
+  // Fixed deadline: a slow pass must not push every later pass.
+  await new Promise((r) => setTimeout(r, Math.max(0, started + INTERVAL_S * 1_000 - Date.now())));
  }
 } else {
  const ok = await pass();
- process.exit(ok ? 0 : 1);
+ // exitCode lets stdout drain (process.exit() can drop the final lines).
+ process.exitCode = ok ? 0 : 1;
 }

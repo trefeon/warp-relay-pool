@@ -24,7 +24,7 @@ Provides N isolated Cloudflare WARP egress addresses paired with public HTTPS UR
 
 ## Quickstart: One-Command Auto Setup
 
-Deploy on any Linux VPS (Ubuntu, Debian, Alpine, Fedora, CentOS):
+Deploy on any Linux VPS with systemd (Ubuntu, Debian, Fedora, CentOS):
 
 ```bash
 git clone https://github.com/trefeon/warp-relay-pool.git
@@ -50,7 +50,10 @@ Or run non-interactively with auto-detected sizing recommendations:
 ## Sizing: Why 5 Relays is the Sweet Spot
 
 For most users and developers running parallel coding subagents, **5 relays** is optimal:
-- **5 Independent Egress IPs:** Upstream rate limits (HTTP 429) are tracked per-IP per-model. 5 relays provide 5x throughput burst capacity.
+- **5 Egress Paths:** Upstream rate limits (HTTP 429) are tracked per-IP per-model. Each WARP
+  client gets its own IPv6 `/128`, so IPv6-capable upstreams see five isolated addresses.
+  IPv4-only upstreams see Cloudflare's shared CGNAT pool, which is why the prober rotates on
+  batches and the status table flags duplicate egress IPs.
 - **Ultra-Low Memory Consumption:**
   - With **TryCloudflare Quick Tunnels**: ~160 MB total RAM (fits comfortably on any 512 MB or 1 GB VPS).
   - With **Tailscale Mesh-VPN**: ~50 MB total RAM.
@@ -106,7 +109,9 @@ docker compose up -d --build
 
 ### Option B: Tailscale Mesh-VPN Direct
 ```bash
-./generate-compose.sh 5
+# The router defaults to 127.0.0.1; bind it to the tailnet address so the
+# documented http://<tailscale-ip>:310N URLs are actually reachable.
+INGRESS_BIND=$(tailscale ip -4) ./generate-compose.sh 5
 docker compose up -d --build
 ./get-status.sh
 ```

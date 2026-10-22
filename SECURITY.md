@@ -65,8 +65,9 @@ Supporting measures already in the tree:
 - `.gitignore` excludes `.env*` (except `.env.example`), `accounts/`,
   `warp*.conf`, `wgcf-*.{conf,toml}`, `*-reg.json`, `backups/`, `devdocs/`,
   and `reference/`.
-- The maintainer's pre-push workflow scans the tree with `gitleaks` and
-  `trufflehog`; keep your own branches free of anything on the list above.
+- CI runs a gitleaks scan on every push and pull request.
+- The maintainer's pre-push workflow additionally scans with `trufflehog`;
+  keep your own branches free of anything on the list above.
 
 ## Reporting a vulnerability
 

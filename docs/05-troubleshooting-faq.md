@@ -37,7 +37,7 @@ upstream quota (`GLOBAL_QUOTA_GUARD`), no rotation helps.
 `docker compose restart relay` re-runs old code. Always
 `docker compose build relay && docker compose up -d relay`.
 
-**Containers not ready / `(starting...)` / `(not ready)`.** WARP clients
+**Containers not ready / `(not ready)`.** WARP clients
 need a minute to handshake after `up` or rotation. Check per layer:
 `docker logs warp-relay-warp-N` (client state), in tunnels mode `docker logs
 warp-relay-tunnel-N` (edge URL line appears only once connected),
@@ -47,8 +47,8 @@ network. `warpReady` in `keep-cold.mjs` gates rotation on Connected +
 real egress for exactly this reason.
 
 **Host port already in use.** If `docker compose up` fails binding `310N`
-or `10800+N` (a local service already claims it — `:3002` collisions are the
-classic case), pick a free range and edit the `ports:` lines in
+or `10800+N` (a local service already claims it — `:3102` or `:10802`
+collisions are the classic case), pick a free range and edit the `ports:` lines in
 `docker-compose.yml` (or the generator), then `up` again. Client lines use
 whatever host ports you publish.
 

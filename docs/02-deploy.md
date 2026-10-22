@@ -1,8 +1,10 @@
 # 02 — Deploy
 
 Runs on a Docker Linux host (needs `NET_ADMIN` for WARP; not Windows).
-Prereqs: `docker compose` and `node` (node only for `keep-cold.mjs`).
-For mesh-VPN ingress, the host must already be joined to your tailnet.
+Prereqs: `docker compose`, `node >= 22` (for `keep-cold.mjs`), and systemd
+for the timers. For mesh-VPN ingress, the host must already be joined to
+your tailnet. `setup.sh` may install Docker and Node itself; if the invoking
+user is not yet in the `docker` group, the wizard re-executes under `sudo`.
 
 ## Quickest: Automated Setup Wizard
 
@@ -15,7 +17,10 @@ The interactive wizard handles everything automatically:
 - Detects VPS RAM and CPU cores, recommends safe relay limits, and defaults to the **5-relay sweet spot** (~160 MB total RAM).
 - Builds the minimal MicroWARP image (`warp-lite:latest`, ~1.8 MiB RAM/node).
 - Deploys TryCloudflare Quick Tunnels (public HTTPS URLs, zero client VPN needed) or Mesh-VPN direct.
-- Installs the `warp-keep-cold.timer` systemd service for automatic 429 rate-limit recovery.
+- Installs the `warp-keep-cold.timer` and `warp-logwatch.timer` systemd units.
+- On an existing deployment, adopts the deployed relay count and ingress
+  mode unless `COUNT=`/`INGRESS=` are pinned (and removes orphan containers
+  when the pool shrinks).
 - Prints the copy-paste `/freeflow add` commands ready for your agent.
 
 To run non-interactively with auto-detected recommendations:
@@ -38,12 +43,15 @@ docker compose up -d --build # ~160 MiB resident total for 5 relays + tunnels
 ### Option B: Mesh-VPN Direct (Tailscale)
 
 ```bash
-./generate-compose.sh 5     # pure mode: MicroWARP + relay, no tunnels
+# Bind the router to the tailnet address, not loopback.
+INGRESS_BIND=$(tailscale ip -4) ./generate-compose.sh 5
 docker compose up -d --build # ~50 MiB resident total for 5 relays
 ./get-status.sh              # ports, egress IPs, mesh-VPN client commands
 ```
 `get-status.sh [count]` (default `COUNT` env, else 10) reads live state
-off the host: egress IPs primarily via the host-side SOCKS probe
+off the host and prints the port a client actually dials (`310N` when the
+router is host-published, otherwise the in-network `300N` marked `*`).
+Egress IPs come primarily via the host-side SOCKS probe
 (`curl -x socks5h://127.0.0.1:<10800+N>` against that relay's WARP
 egress, with a `docker exec warp-relay-warp-N curl …/cdn-cgi/trace`
 fallback), tunnel URLs from `docker logs warp-relay-tunnel-N`. Its
@@ -53,8 +61,15 @@ output is host-only — never commit it.
 
 ```bash
 ./generate-compose.sh <N> [--with-tunnels] [--legacy-warp]  # rewrites docker-compose.yml, RELAY_COUNT=N
-docker compose up -d --build
+docker compose up -d --build --remove-orphans
 ```
+
+The project name is the checkout directory name, so re-deploy in the same
+directory to keep the `warp-data-N` volumes (they hold the WARP
+registrations; new names mint new registrations). Shrinking the pool leaves
+the removed `warp-relay-pool_warp-data-<N>` volumes behind — remove them
+with `docker volume rm` once you are sure the extra egress identities are
+not needed.
 
 `--legacy-warp` swaps the minimal MicroWARP image for
 `caomingjun/warp:latest` (~100 MiB per relay instead of ~1.8 MiB). Every
@@ -77,18 +92,25 @@ default naming needs no configuration.
 ## Keep-cold timer (systemd)
 
 ```bash
-node keep-cold.mjs --once      # one pass now; exit 0 when all clean
+node keep-cold.mjs --once      # one pass now; exit 0 only when every relay is clean
 sudo cp systemd/warp-keep-cold.{service,timer} /etc/systemd/system/
-# edit paths to your checkout first, then:
+# edit User=/WorkingDirectory=/ExecStart= AND Environment=COUNT=/BASE_PORT=
+# to match the deployed pool (setup.sh does this automatically), then:
+sudo systemctl daemon-reload
 sudo systemctl enable --now warp-keep-cold.timer
 ```
 
-The service is `Type=oneshot` with `TimeoutStartSec=900` (a pass can
-rotate several relays, each waiting for WARP re-handshake) and `flock -n`
-so overlapping timer fires never stack. The timer fires every 5 minutes
-(`OnCalendar`). Without `--loop`, one pass = one timer fire.
-See [04](04-operations-keep-cold.md) for tuning (notably
-`GLOBAL_QUOTA_GUARD`).
+The service is `Type=oneshot` with `TimeoutStartSec=3600` (at the default
+serial rotation, a stuck relay can spend ~6 minutes per attempt) and
+`flock -n -E 0` so an overlapping timer fire is contention, not failure.
+The timer fires every 5 minutes (`OnCalendar`). Without `--loop`, one pass
+= one timer fire.
+
+Exit status: `0` = every relay clean; `1` = a relay is still hot, a
+server_error held, a 502 did not recover, or a model is throttled on
+`GLOBAL_QUOTA_GUARD` relays (upstream quota — logged as
+`quota-capped`, deliberately not rotated). See
+[04](04-operations-keep-cold.md) for tuning.
 
 ## Error watcher (logwatch, optional)
 
@@ -98,11 +120,16 @@ for rollover summaries; state lives in `logs/.cursor` / `.last` /
 `.events`.
 
 ```bash
-sudo cp systemd/warp-logwatch.{service,timer} /etc/systemd/system/  # edit paths first
+sudo cp systemd/warp-logwatch.{service,timer} /etc/systemd/system/
+# edit User=/WorkingDirectory=/ExecStart= and Environment=COUNT= first
+sudo systemctl daemon-reload
 sudo systemctl enable --now warp-logwatch.timer   # every 2 minutes; flock-guarded
 ```
 
-Its suite is part of CI: `bash logwatch.test.sh`.
+`Environment=COUNT` must match the deployed pool, and the service user must
+read the Docker socket and the system journal (`SupplementaryGroups` in the
+shipped unit grants `docker` and `systemd-journal`). Its suite is part of
+CI: `bash logwatch.test.sh`.
 
 ## Rebuild, don't restart
 

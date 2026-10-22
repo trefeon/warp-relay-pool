@@ -33,6 +33,7 @@ LOG_DIR="${LOG_DIR:-$POOL_DIR/logs}"
 COUNT="${COUNT:-10}"
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-warp-relay-warp-}"
 APP_CONTAINER="${APP_CONTAINER:-warp-relay-app}"
+TUNNEL_PREFIX="${TUNNEL_PREFIX:-warp-relay-tunnel-}"
 JOURNAL_UNIT="${JOURNAL_UNIT:-warp-keep-cold.service}"
 MAX_BYTES="${MAX_BYTES:-10485760}"
 KEEP_ROTATED="${KEEP_ROTATED:-5}"
@@ -49,6 +50,13 @@ DAYFILE="$LOG_DIR/.day"
 # digit-guarded so PIDs and ports never match; everything else is a
 # plain substring. g(a|i)ve covers both GIVE UP and GAVE UP.
 MATCH_RE='error|fail|refus|timeout|g(a|i)ve up|troubled|server_error|still failing|unexpected http|proxy error|fetch failed|econnrefused|epipe|(^|[^0-9])(429|500|502|403)([^0-9]|$)'
+
+# Compare two source keys in C collation. `test` has no portable `<`, and the
+# keys mix fixed-width timestamps with junk sentinels; the x-prefix forces
+# expr's string mode. Used only inside a refetch-overlap window.
+key_lt() {
+  [ "$(LC_ALL=C expr "x$1" \< "x$2" 2>/dev/null)" = "1" ]
+}
 
 # Junk-key sentinels: normalized keys for heads that carry no usable
 # timestamp — docker CLI stderr ("Error: No such container: ...") and
@@ -309,7 +317,7 @@ process_source() {
     # Refetch-overlap skip (see the comment above this function).
     if [ -n "$ps_b" ]; then
       ps_old=no
-      if [ "$ps_lk" \< "$ps_pkey" ]; then
+      if key_lt "$ps_lk" "$ps_pkey"; then
         ps_old=yes
         # A junk key sorts below every real key by construction, so the
         # < branch alone would silently drop a first-occurrence
@@ -445,6 +453,20 @@ done
 out="$TMPDIR_WORK/docker-app"
 scrape_docker "$APP_CONTAINER" > "$out" || true
 process_source "$APP_CONTAINER" "$out" docker
+
+# Tunnels are optional (mesh installs have none) and their death silently
+# breaks every configured client URL, so watch the ones that exist. One
+# `docker ps` beats COUNT inspect calls on every scrape.
+RUNNING_CONTAINERS="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
+for name in $RUNNING_CONTAINERS; do
+  case "$name" in
+    "${TUNNEL_PREFIX}"[0-9]*) ;;
+    *) continue ;;
+  esac
+  out="$TMPDIR_WORK/$name"
+  scrape_docker "$name" > "$out" || true
+  process_source "$name" "$out" docker
+done
 
 out="$TMPDIR_WORK/journal"
   journalctl -u "$JOURNAL_UNIT" --since "$J_SINCE" --no-pager 2>&1 \

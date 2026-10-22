@@ -22,10 +22,16 @@ never touched, so every `<RELAY-N-URL>` survives rotation.
   - **Tier 1 (Default):** Restarts only the container (`docker restart warp-relay-warp-N`). Keeps the existing WireGuard keys in `/etc/wireguard` but acquires a fresh `/64` egress IP path from Cloudflare without spending an account registration.
   - **Tier 2 (Fallback):** If a relay remains throttled after Tier 1, clears `/etc/wireguard/wg0.conf` and restarts to force a brand new account registration.
 - **Upstream `server_error` Detection:** Scans the first 2 SSE chunks on HTTP 200 responses to catch upstream provider crashes ("The model failed to generate a response"), preventing futile rotation loops during upstream outages.
-- Concurrency: `runPool` bounds parallel restarts by `ROTATE_CONCURRENCY`.
+- Concurrency: `runPool` bounds parallel restarts by `ROTATE_CONCURRENCY`
+  (default `1`; concurrent WARP restarts can trip Cloudflare registration
+  limits, so raise it only deliberately).
+- Tier-2 budget: at most **one re-key per relay per pass**, and no re-key for
+  the same relay within `TIER2_MIN_INTERVAL_S` (default 1 h), persisted in
+  `TIER2_STATE_FILE` (default `.keep-cold/tier2-state.json`).
 ```bash
 node keep-cold.mjs --once            # single pass (what the timer runs)
 INTERVAL_S=600 node keep-cold.mjs --loop   # pass every 10 min, foreground
+node keep-cold.mjs --help            # usage (unknown flags exit 2)
 ```
 
 ## Tunables
@@ -41,8 +47,12 @@ INTERVAL_S=600 node keep-cold.mjs --loop   # pass every 10 min, foreground
 | `RESPONSES_MODELS` | `dots-studio/dots-3-note-preview:free` | Probed via `PROBE_RESPONSES_PATH`; rest via `PROBE_CHAT_PATH` |
 | `GLOBAL_QUOTA_GUARD` | `max(8, COUNT - 1)` (= 9 at `COUNT=10`) | 429-on-this-many-relays = upstream quota, skip rotation (capped at `COUNT`; override via env, see `.env.example`) |
 | `SPEED_MODEL` / `SLOW_THRESHOLD_MS` / `SLOW_MAX_ROTATIONS` | `nvidia/nemotron-3.5-lightning:free` / `0` / `2` | Speed rotation, disabled by default |
-| `MAX_ROTATIONS` | `4` | Restarts per 429-relay per pass |
-| `ROTATE_CONCURRENCY` | `3` | Parallel restarts |
+| `MAX_ROTATIONS` | `4` | Tier-1 restarts per relay per pass (tier 2 runs at most once per pass) |
+| `TIER2_MIN_INTERVAL_S` / `TIER2_STATE_FILE` | `3600` / `.keep-cold/tier2-state.json` | Minimum gap between tier-2 re-keys for one relay, persisted across timer fires |
+| `ROTATE_CONCURRENCY` | `1` | Parallel rotations (serial by default) |
+| `SOCKS_HOST` / `SOCKS_PORT_BASE` | `127.0.0.1` / `10800` | Host dial path for the readiness/egress probes |
+| `SERVER_ERROR_RETRY` / `SERVER_ERROR_REPROBE_MS` | `1` / `5000` | Same-egress re-probes before a server_error t1 |
+| `SERVER_ERROR_GUARD` | `9` (capped at `COUNT`) | server_error on this many relays = upstream incident, skip rotation |
 | `CONTAINER_PREFIX` | `warp-relay-warp-` | `docker restart ${PREFIX}N` target |
 | `READY_TIMEOUT_MS` / `PROBE_TIMEOUT_MS` | `180000` / `30000` | Post-restart WARP ready wait / per-probe timeout |
 | `INTERVAL_S` | `300` | `--loop` seconds between passes |
@@ -50,8 +60,8 @@ INTERVAL_S=600 node keep-cold.mjs --loop   # pass every 10 min, foreground
 
 ## Warp-only rule
 
-`docker restart warp-relay-warp-N` (or `docker restart warp-N` inside
-compose) is the only rotation action. Never restart `tunnel-N` or `relay`
+`docker restart warp-relay-warp-N` (or `docker compose restart warp-N`) is
+the only rotation action. Never restart `tunnel-N` or `relay`
 for a hot egress: tunnel restarts mint new `*.trycloudflare.com` URLs
 (breaking every pasted `/freeflow add` line) and relay restarts drop all
 ten listeners for nothing.
