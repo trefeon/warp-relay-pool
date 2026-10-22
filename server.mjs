@@ -1,9 +1,10 @@
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Agent } from "undici";
+import { createSignalWriter } from "./signal-writer.mjs";
 
 const COUNT = parseInt(process.env.RELAY_COUNT || "10", 10);
 // Per-listener in-flight cap. Streaming responses hold sockets for minutes,
@@ -19,6 +20,17 @@ const ALLOWED_TARGETS = (process.env.RELAY_ALLOWED_TARGETS ?? DEFAULT_ALLOWED_TA
   .map((s) => s.trim().replace(/\/$/, ""))
   .filter(Boolean);
 
+// Live rate-limit signals: report the egress/model that just answered 429 so
+// keep-cold can rotate only what is actually throttled. Off by default — the
+// probe scheduler stays the fallback.
+const LIVE_SIGNALS = process.env.LIVE_SIGNALS === "1";
+const LIVE_SIGNAL_FILE = process.env.LIVE_SIGNAL_FILE || ".keep-cold/signals.json";
+const signalWriter = LIVE_SIGNALS ? createSignalWriter({ file: LIVE_SIGNAL_FILE }) : null;
+// Enough to cover a chat-completions preamble (stream flags, tool schemas) on
+// every real client; the model field appears before the first message.
+const MODEL_SCAN_BYTES = 16 * 1024;
+const MODEL_FIELD_RE = /"model"\s*:\s*"([^"]+)"/;
+
 // Request handlers catch their own failures, so an exception that reaches the
 // process is a programming error: log it and let Docker restart a clean
 // process. Continuing would leave a half-dead relay that `restart: always`
@@ -28,6 +40,7 @@ process.on("unhandledRejection", (err) => {
 });
 process.on("uncaughtException", (err) => {
   console.error(`[relay] uncaughtException: ${err?.stack ?? String(err)}`);
+  signalWriter?.flush();
   process.exit(1);
 });
 
@@ -158,6 +171,27 @@ const DROP_HEADERS = new Set([
   "accept-encoding",
 ]);
 
+// The upstream status alone does not say which model was throttled, and the
+// body cannot be buffered (streaming requests, memory). This tee reads the
+// model field out of the first MODEL_SCAN_BYTES and forwards every byte.
+function createModelSniffer() {
+  let seen = "";
+  const sniffer = new Transform({
+    transform(chunk, _enc, done) {
+      if (sniffer.model === null && seen.length < MODEL_SCAN_BYTES) {
+        // latin1 keeps one char per byte when a chunk splits a UTF-8 rune;
+        // model ids are ASCII, so the pattern still matches.
+        seen += chunk.subarray(0, MODEL_SCAN_BYTES - seen.length).toString("latin1");
+        const match = MODEL_FIELD_RE.exec(seen);
+        if (match) sniffer.model = match[1];
+      }
+      done(null, chunk);
+    },
+  });
+  sniffer.model = null;
+  return sniffer;
+}
+
 function createRelayInstance(index) {
   const port = BASE_PORT + index;
   const warpHost = process.env[`WARP_HOST_${index}`] || `warp-${index}`;
@@ -256,11 +290,15 @@ function createRelayInstance(index) {
     req.once("close", onClientClose);
     res.once("close", onClientClose);
     const upstreamTimeout = AbortSignal.timeout(300000);
+    // Only bodies can name a model; with signals off the request object is
+    // handed to fetch exactly as before.
+    const hasBody = req.method !== "GET" && req.method !== "HEAD";
+    const sniffer = signalWriter && hasBody ? createModelSniffer() : null;
     try {
       const upstream = await fetch(upstreamUrl, {
         method: req.method,
         headers,
-        body: req.method !== "GET" && req.method !== "HEAD" ? req : undefined,
+        body: hasBody ? (sniffer ? req.pipe(sniffer) : req) : undefined,
         duplex: "half",
         // The allowlist constrains the first hop only; following a redirect
         // would let an allowlisted origin steer the relay to any host.
@@ -268,6 +306,26 @@ function createRelayInstance(index) {
         dispatcher,
         signal: AbortSignal.any([upstreamTimeout, controller.signal]),
       });
+
+      if (signalWriter) {
+        // Best-effort and additive: a signal failure must never reach the
+        // response path.
+        try {
+          const model = sniffer?.model ?? "unknown";
+          if (upstream.status === 429) {
+            signalWriter.record({
+              relay: index,
+              model,
+              status: 429,
+              retryAfter: Number(upstream.headers.get("retry-after")) || null,
+            });
+          } else if (upstream.status === 200) {
+            signalWriter.record({ relay: index, model, status: 200 });
+          }
+        } catch {
+          // Ignored: keep-cold falls back to probing.
+        }
+      }
 
       // Forward only what the client needs: full header copies cost per-request
       // work and risk stale content-encoding/content-length (fetch decodes
@@ -318,6 +376,7 @@ function createRelayInstance(index) {
   // is invisible to `restart: always` and only shows up as per-port 502s.
   server.on("error", (err) => {
     console.error(`[relay #${index}] fatal listen error: ${err?.stack ?? String(err)}`);
+    signalWriter?.flush();
     process.exit(1);
   });
 
@@ -338,6 +397,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[relay] ${signal} received — draining ${servers.length} listener(s)`);
+  signalWriter?.flush();
   for (const server of servers) {
     server.close();
     server.closeIdleConnections?.();

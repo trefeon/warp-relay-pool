@@ -462,6 +462,16 @@ log_info "Generating docker-compose.yml for ${COUNT} relays..."
 # shellcheck disable=SC2086
 sh ./generate-compose.sh "$COUNT" $WITH_TUNNELS_FLAG
 
+# Shared scheduler state: the relay app bind-mounts ./.keep-cold at /signals
+# and writes signals.json as container root, while the host keep-cold prober
+# (User=trefeon) writes state.json here. 0777 is deliberate and safe: the dir
+# holds relay indexes, model names and timestamps only — no egress IPs, no
+# secrets — and both writers replace files atomically (tmp + rename), so a
+# root-owned signal file never blocks the host prober. The wizard may already
+# be running as root (daemon re-exec), which is exactly why the mode is what
+# grants access instead of ownership.
+install -d -m 0777 .keep-cold
+
 log_info "Starting containers with Docker Compose..."
 $DOCKER_COMPOSE up -d --build --remove-orphans
 

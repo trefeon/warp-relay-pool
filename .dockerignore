@@ -1,4 +1,5 @@
-# The relay image needs only package.json, package-lock.json and server.mjs.
+# The relay image needs only package.json, package-lock.json, server.mjs and
+# signal-writer.mjs.
 # Keep the whole checkout (including .env and WARP account material) out of
 # the build context.
 .git
@@ -15,3 +16,6 @@ test
 docs
 systemd
 warp-lite
+# keep-cold runtime state (host-side scheduler + live-signal files): a bind
+# mount at runtime, never build input.
+.keep-cold

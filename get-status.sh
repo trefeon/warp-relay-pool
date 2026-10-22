@@ -115,6 +115,67 @@ if [ -z "$ROUTER_PUBLISHED" ]; then
   echo "* in-network relay port (tunnels mode publishes no host port)"
 fi
 
+# Keep-cold scheduler state (bounded, read-only). The prober writes
+# RELAY_STATE_FILE; CI and fresh checkouts have neither node nor the file, and
+# both cases must stay silent rather than fail the table above. Nothing here
+# reads an egress address — the state holds relay indexes, models and
+# timestamps only, and that is all this section may print.
+STATE_FILE="${RELAY_STATE_FILE:-.keep-cold/state.json}"
+if command -v node >/dev/null 2>&1 && [ -f "$STATE_FILE" ]; then
+  STATE_FILE="$STATE_FILE" RELAY_COUNT="$COUNT" node -e '
+const fs = require("fs");
+let state;
+try {
+  state = JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8"));
+} catch (err) {
+  process.exit(0);
+}
+const relays = state && typeof state === "object" ? state.relays : null;
+if (!relays || typeof relays !== "object") process.exit(0);
+const count = Number(process.env.RELAY_COUNT) || 0;
+const nowSec = Date.now() / 1000;
+const epochSec = function (value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n > 1e11 ? Math.round(n / 1000) : Math.round(n);
+};
+const rows = [];
+const hourAgo = nowSec - 3600;
+for (let i = 1; i <= count; i += 1) {
+  const rec = relays[String(i)] || relays["warp-" + i];
+  if (!rec || typeof rec !== "object") continue;
+  const failures = Number(rec.consecutiveFailures) || 0;
+  const until = epochSec(rec.cooldownUntil);
+  const cooling = until > nowSec ? Math.round(until - nowSec) : 0;
+  const dirty = rec.dirty === true || rec.dirty === "yes" || failures > 0;
+  let hourly = 0;
+  if (Array.isArray(rec.rotations)) {
+    for (const ts of rec.rotations) {
+      if (epochSec(ts) > hourAgo) hourly += 1;
+    }
+  }
+  let model = "";
+  if (rec.last429 && typeof rec.last429 === "object") {
+    model = rec.last429.model ? String(rec.last429.model) : "";
+  } else if (typeof rec.last429 === "string") {
+    model = rec.last429;
+  }
+  rows.push(
+    "  #" + i +
+    " dirty=" + (dirty ? "yes" : "no") +
+    " cooldown=" + cooling + "s" +
+    " failures=" + failures +
+    " rotations1h=" + hourly +
+    (rec.pendingVerify === true ? " pending=yes" : "") +
+    " last429=" + (model || "(none)")
+  );
+}
+if (rows.length === 0) process.exit(0);
+process.stdout.write("\n=== keep-cold scheduler (last known per-relay state) ===\n");
+process.stdout.write(rows.join("\n") + "\n");
+' 2>/dev/null || true
+fi
+
 TS_IP="$(mesh_ip)"
 [ -z "$TS_IP" ] && TS_IP="<tailscale-ip>"
 

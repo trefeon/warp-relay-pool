@@ -3,8 +3,11 @@
 # Topology: bridge 10.244.0.0/16, relay app fixed at 10.244.0.100.
 # warp-N raw SOCKS5 proxy on 127.0.0.1:<10800+N> (override bind: WARP_BIND),
 # relay router (mesh-VPN ingress) on 127.0.0.1:3101-3110 (override bind: INGRESS_BIND).
-# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS) is baked from
-# the generation-time environment / .env — regenerate after editing either.
+# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS, LIVE_SIGNALS,
+# LIVE_SIGNAL_FILE) is baked from the generation-time environment / .env —
+# regenerate after editing either.
+# The relay app bind-mounts ./.keep-cold at /signals so its 429 signal file
+# lands in the same directory the host keep-cold reads (LIVE_SIGNALS=1).
 networks:
   default:
     ipam:
@@ -275,6 +278,10 @@ services:
       - RELAY_COUNT=10
       - BASE_PORT=3000
       - RELAY_ALLOWED_TARGETS=https://opencode.ai,https://api.kilo.ai
+      - LIVE_SIGNALS=0
+      - LIVE_SIGNAL_FILE=/signals/signals.json
+    volumes:
+      - ./.keep-cold:/signals
     networks:
       default:
         ipv4_address: 10.244.0.100

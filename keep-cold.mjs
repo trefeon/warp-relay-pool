@@ -1,116 +1,150 @@
 #!/usr/bin/env node
 /**
- * keep-cold.mjs — MicroWARP egress prober/rotator (serverError class 2026-10-05).
+ * keep-cold.mjs — demand-driven MicroWARP egress prober/rotator.
  *
  * Every relay in this pool reaches the upstream through its own Cloudflare WARP
- * client container, so each has its own egress IPv6 address. Cloudflare recycles
- * those addresses across public WARP users, which means a container can come up
- * already throttled by the upstream provider (HTTP 429) even though the relay
- * itself is perfectly healthy.
+ * client container, so each has its own egress IPv6 address. Cloudflare
+ * recycles those addresses across public WARP users, which means a container
+ * can come up already throttled by the upstream provider (HTTP 429) even
+ * though the relay itself is perfectly healthy. Throttling is PER MODEL per
+ * egress IP: warp-1 can serve one model 200 while 429ing another on the same
+ * address (observed 2026-10-02), so one model is never enough to declare a
+ * relay clean.
  *
- * Throttling is PER MODEL per egress IP: warp-1 can serve nemotron 200 while
- * answering 429 for mimo-v2.5 on the same address (observed 2026-10-02), so a
- * single-model probe misses throttled relays. This script probes every relay
- * with a real streaming inference request for EACH model in PROBE_MODELS
- * (chat + responses paths) and, for any relay throttled on any model, restarts
- * ONLY that relay's WARP client container until every probed model answers
- * 200 (bounded by MAX_ROTATIONS per relay per pass).
+ * Demand-driven probing
+ * ---------------------
+ * The first pass (RELAY_STATE_FILE holds no relay entries) is a full baseline
+ * sweep of every relay 1..COUNT x PROBE_MODELS: only a 200/429 answers tell us
+ * what the pool is doing. Every later pass probes only
+ *   - relays a restart is still waiting to verify (pendingVerify, once the
+ *     EGRESS_SETTLE_S window after that restart has elapsed),
+ *   - relays still marked dirty whose probeAfter timer expired,
+ *   - a round-robin audit sample of PROBE_AUDIT_SAMPLE clean relays, so a
+ *     silent per-egress throttle is still discovered,
+ *   - relays named by live traffic signals (LIVE_SIGNALS=1, written by
+ *     server.mjs), which are rotated without any inference probe at all.
+ * On a healthy 20-relay pool that is PROBE_AUDIT_SAMPLE requests per pass
+ * instead of COUNT * |PROBE_MODELS| (60 before this change) — the disk-I/O
+ * storm the old full sweep caused on the 5400 rpm host is gone.
  *
- * A model throttled on a MAJORITY of relays is treated as upstream model
- * quota (no egress rotation can fix it): it is skipped for rotation decisions
- * this pass (see GLOBAL_QUOTA_GUARD), so one globally-capped probe model can
- * never churn all 10 WARP clients pointlessly.
+ * One restart per cooldown
+ * ------------------------
+ * A relay is restarted at most once per RELAY_COOLDOWN_S, at most
+ * RELAY_MAX_ROTATIONS_PER_HOUR times per rolling hour, never inside the
+ * EGRESS_SETTLE_S window that follows its previous restart, and only when its
+ * cooldown has expired. Repeated failing batches multiply the cooldown
+ * (RELAY_BACKOFF_BASE_S * 2^(n-1), capped at RELAY_BACKOFF_MAX_S), so a relay
+ * that stays throttled backs off instead of churning. There is NO post-restart
+ * probe, NO readiness wait and NO retry loop: the restart is recorded and a
+ * later pass verifies it once the settle window has passed. All docker
+ * restarts (tier-1, tier-2, 502 and server_error) share one serialisation
+ * chain that starts them at least ROTATE_SPACING_MS apart.
  *
- * Upstream server_error ("The model failed to generate a response") is its own
- * class between hot/429 (rotate) and troubled (never rotate), in two shapes:
- * transport (non-200 JSON carrying server_error) and envelope (HTTP 200 SSE
- * carrying response.failed/server_error — probe() reads the first 2 chunks,
- * ~4KB cap, before declaring clean). Per pass and per relay: 1 same-egress
- * re-probe after ~5s (transient filter), then a SINGLE tier-1 restart only
- * (zero registration cost), then hold to next pass when still failing — never
- * tier-2. A model failing on SERVER_ERROR_GUARD relays is an upstream
- * incident: rotation is skipped for it this pass. Holds exit 1 like troubled.
+ * A 429 carrying a numeric `retry-after` <= 120 s never restarts: it sets the
+ * next probe time instead. Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
+ * one Cloudflare registration) is used only for pure 429 batches, at most once
+ * per relay per TIER2_MIN_INTERVAL_S; server_error and 502 rotations are
+ * tier-1 only. Nodes without wg0.conf abort the re-key and fall back to a
+ * plain restart, leaving their registration untouched.
  *
- * Speed ranking is logged per pass but rotation on speed is DISABLED
- * (SLOW_THRESHOLD_MS=0): the 2026-10-02 trial falsified single-sample rank as
- * an egress signal — #5 ranked slowest (9920ms) then 2nd-fastest (1292ms)
- * minutes later, #8 fastest (1867ms) then mid-pack. Rank reshuffles fully
- * between passes = upstream variance, not egress quality. Every pass still
- * logs `speed <model>: #N Nms …` for observability; re-enable rotation only
- * with median-over-N-passes proof.
+ * Guardrails
+ * ----------
+ * A model throttled on GLOBAL_QUOTA_GUARD relays is upstream model quota: it is
+ * skipped for rotation this pass, and relays failing only on such models are
+ * reported as quota-capped and never counted clean. The same guard reads the
+ * 429 history kept in the state file (900 s window), so quota is recognised
+ * across passes. A model failing with server_error on SERVER_ERROR_GUARD relays
+ * is an upstream incident: rotation is skipped for it this pass.
+ *
+ * Status 0 (the host cannot reach the relay) and any other unexpected status
+ * (403/500/503/...) are troubled: no restart, the relay waits
+ * RELAY_COOLDOWN_S before the next probe. A server_error keeps its same-egress
+ * re-probe filter (SERVER_ERROR_RETRY x SERVER_ERROR_REPROBE_MS) before the
+ * gate; a server_error that clears on re-probe is clean.
+ *
+ * Speed ranking is logged per pass (`speed <model>: #N Nms …`) but rotation on
+ * speed is DISABLED by default (SLOW_THRESHOLD_MS=0): the 2026-10-02 trial
+ * falsified single-sample rank as an egress signal. With a threshold set, a
+ * slow relay goes through the same gate/restart path, tier-1 only.
  *
  * The public relay URLs never change: the `*.trycloudflare.com` tunnels and the
  * relay application are different containers and are never touched here. Only
  * `warp-relay-warp-N` is ever restarted, so every URL already configured in the
  * client pool keeps working through the rotation.
  *
+ * State (JSON, ms epochs) and signals are optimisations: a missing, corrupt or
+ * unwritable state file (or signal file) degrades to a full sweep and a pass
+ * that still runs, never a failed pass.
+ *
+ * Exit codes
+ *  0  every relay is known clean at the end of the pass: nothing dirty, no
+ *     quota-capped relay left failing, nothing troubled, no rotation awaiting
+ *     verification
+ *  1  at least one relay is dirty / held / throttled / awaiting verification
+ *  2  bad usage or invalid environment
+ *
  * Usage:
- *   node keep-cold.mjs --once                 # single pass, exit 0 when all clean
+ *   node keep-cold.mjs --once                 # single pass
  *   node keep-cold.mjs --loop                 # pass every INTERVAL_S seconds
  *   INTERVAL_S=600 node keep-cold.mjs --loop
  *
- * Environment:
+ * Environment (new in this revision):
+ *   RELAY_STATE_FILE    per-relay state (default .keep-cold/state.json)
+ *   RELAY_COOLDOWN_S    minimum gap between rotations of one relay (default 600)
+ *   RELAY_BACKOFF_BASE_S / RELAY_BACKOFF_MAX_S  exponential cooldown on repeated
+ *                       failure, seconds (default 300 / 3600)
+ *   RELAY_MAX_ROTATIONS_PER_HOUR  hard hourly budget per relay (default 2)
+ *   PROBE_AUDIT_SAMPLE  clean relays probed per pass (default 2, min 0, max COUNT)
+ *   EGRESS_SETTLE_S     post-restart quiet window before probing again (default 150)
+ *   ROTATE_SPACING_MS   serialisation gap between restart operations (default 4000)
+ *   LIVE_SIGNALS        1 = consume LIVE_SIGNAL_FILE (default 0)
+ *   LIVE_SIGNAL_FILE    live 429/recovery records from server.mjs
+ *                       (default .keep-cold/signals.json)
+ *   PROBE_CONCURRENCY   relays probed in parallel (default 4, 1..64)
+ *   KEEP_COLD_CLOCK_SKEW_S  test aid: now() = Date.now() + skew*1000 (default 0)
+ *   DOCKER_BIN          docker binary (default docker)
+ *   DOCKER_PREFIX_ARGS  space-separated args inserted before every docker
+ *                       argument list (default empty)
+ *
+ * Environment (unchanged, still honoured):
  *   RELAY_HOST          relay app bridge address      (default 10.244.0.100)
  *   BASE_PORT           first relay port              (default 3000)
  *   COUNT               number of relays              (default 10)
- *   SOCKS_HOST          host dialed for the SOCKS readiness/egress probes
- *                       (default 127.0.0.1; set this to the WARP_BIND address
- *                       when the SOCKS family is bound to an
- *                       interface-specific address, since loopback then has
- *                       no listener. 0.0.0.0 binds still answer on loopback)
  *   PROBE_TARGET        upstream the probes go through (default
- *                       https://api.kilo.ai — the lane clients actually
- *                       use; OpenCode's Zen free tier has refused every
- *                       non-OpenCode client with 403 FreeTierError since
- *                       2026-10-14, fingerprints included)
+ *                       https://api.kilo.ai — the lane clients actually use)
  *   PROBE_CHAT_PATH     chat wire path under PROBE_TARGET (default
  *                       /api/gateway/chat/completions)
  *   PROBE_RESPONSES_PATH  responses wire path under PROBE_TARGET (default
  *                       /api/gateway/responses)
- *   PROBE_MODELS        comma-separated models to probe (default
- *                       nvidia/nemotron-3.5-lightning:free,
- *                       cohere/north-mini-code:free,
- *                       dots-studio/dots-3-note-preview:free — three
- *                       families so per-model throttles stay
- *                       distinguishable)
+ *   PROBE_MODELS        comma-separated models to probe (default three
+ *                       families so per-model throttles stay distinguishable)
  *   PROBE_MODEL         legacy single-model override (used only when
  *                       PROBE_MODELS is unset)
- *   RESPONSES_MODELS    comma-separated models probed via
- *                       PROBE_RESPONSES_PATH (default
- *                       dots-studio/dots-3-note-preview:free; everything
- *                       else probes via PROBE_CHAT_PATH)
- *   GLOBAL_QUOTA_GUARD  relays-429ed threshold at which a model counts as
- *                       upstream quota, not egress throttle (default
- *                       max(8, COUNT-1), capped at COUNT). Quota-capped
- *                       models are skipped for rotation this pass.
- *   SERVER_ERROR_RETRY    same-egress re-probes before a server_error
- *                       rotation (default 1 — stateless transient filter)
+ *   RESPONSES_MODELS    comma-separated models probed via PROBE_RESPONSES_PATH
+ *   GLOBAL_QUOTA_GUARD  relays-throttled threshold at which a model counts as
+ *                       upstream quota (default max(8, COUNT-1), capped at COUNT)
+ *   SERVER_ERROR_RETRY  same-egress re-probes before a server_error rotation
+ *                       (default 1)
  *   SERVER_ERROR_REPROBE_MS  delay before each re-probe (default 5000)
- *   SERVER_ERROR_GUARD    relays-with-server_error threshold at which a model
- *                       counts as upstream incident, not egress fault
- *                       (default 9, capped at COUNT)
- *   SPEED_MODEL         model whose latency decides slow rotation (default
- *                       nvidia/nemotron-3.5-lightning:free; must be in
- *                       PROBE_MODELS to have timings)
+ *   SERVER_ERROR_GUARD  relays-with-server_error threshold at which a model
+ *                       counts as upstream incident (default 9, capped at COUNT)
+ *   SPEED_MODEL         model whose latency decides slow rotation
  *   SLOW_THRESHOLD_MS   200-response slower than this is rotated for speed
- *                       (default 0 = DISABLED — single-sample rank proven
- *                       upstream noise 2026-10-02; re-enable only on
- *                       median-over-N evidence)
- *   SLOW_MAX_ROTATIONS  restarts per slow relay per pass (default 2 —
- *                       separate budget from the 429 path)
+ *                       (default 0 = disabled)
  *   CONTAINER_PREFIX    docker container prefix       (default warp-relay-warp-)
- *   READY_TIMEOUT_MS    wait for a rotated relay      (default 180000)
  *   PROBE_TIMEOUT_MS    per-probe request timeout     (default 30000)
- *   MAX_ROTATIONS       tier-1 restarts per relay per pass (default 4;
- *                       tier 2 runs at most once per relay per pass)
- *   TIER2_MIN_INTERVAL_S  minimum seconds between tier-2 re-keys for one
- *                       relay, persisted in TIER2_STATE_FILE (default 3600)
- *   ROTATE_CONCURRENCY  parallel restarts             (default 1)
+ *   TIER2_MIN_INTERVAL_S  minimum seconds between tier-2 re-keys for one relay,
+ *                       persisted in TIER2_STATE_FILE (default 3600)
+ *   ROTATE_CONCURRENCY  parallel rotation workers     (default 1)
  *   INTERVAL_S          seconds between loop passes   (default 300)
- *   SOCKS_PORT_BASE     host SOCKS port for relay N   (default 10800)
  *   KEEP_COLD_LOG       append the log to this file   (default stdout only)
  *   KEEP_COLD_LOG_MAX_BYTES  rotate above this size    (default 2 MiB)
  *   KEEP_COLD_LOG_KEEP_BYTES keep this much on rotate   (default 200 KiB)
+ *
+ * Environment (accepted and ignored — kept so installed unit files stay valid):
+ *   READY_TIMEOUT_MS, SOCKS_HOST, SOCKS_PORT_BASE, MAX_ROTATIONS,
+ *   SLOW_MAX_ROTATIONS. Nothing here waits for readiness or verifies a rotation
+ *   inline any more; those knobs only guarded the old retry loop.
  */
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -165,6 +199,7 @@ function envInt(name, dflt, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
  return n;
 }
 
+/** Validate a probe wire path (rooted, no scheme). */
 function envPath(name, dflt) {
  const value = process.env[name] ?? dflt;
  if (!value.startsWith("/")) {
@@ -186,11 +221,22 @@ function envUrl(name, dflt) {
  return value;
 }
 
+/**
+ * Filesystem path: relative (the repo-relative defaults) or absolute (unit
+ * files, tests). Only blank values are rejected.
+ */
+function envFile(name, dflt) {
+ const value = process.env[name] ?? dflt;
+ if (value.trim() === "") {
+  console.error(`keep-cold: ${name} is set but blank`);
+  process.exit(2);
+ }
+ return value;
+}
+
 const RELAY_HOST = process.env.RELAY_HOST ?? "10.244.0.100";
-const SOCKS_HOST = process.env.SOCKS_HOST ?? "127.0.0.1";
 const BASE_PORT = envInt("BASE_PORT", 3000, { max: 65535 });
 const COUNT = envInt("COUNT", 10, { min: 1, max: 64 });
-const SOCKS_PORT_BASE = envInt("SOCKS_PORT_BASE", 10800, { min: 1, max: 65535 });
 const PROBE_TARGET = envUrl("PROBE_TARGET", "https://api.kilo.ai");
 const PROBE_CHAT_PATH = envPath("PROBE_CHAT_PATH", "/api/gateway/chat/completions");
 const PROBE_RESPONSES_PATH = envPath("PROBE_RESPONSES_PATH", "/api/gateway/responses");
@@ -214,18 +260,56 @@ const RESPONSES_MODELS = new Set(
 const GLOBAL_QUOTA_GUARD = Math.min(envInt("GLOBAL_QUOTA_GUARD", Math.max(8, COUNT - 1), { min: 1 }), COUNT);
 const SPEED_MODEL = process.env.SPEED_MODEL ?? "nvidia/nemotron-3.5-lightning:free";
 const SLOW_THRESHOLD_MS = envInt("SLOW_THRESHOLD_MS", 0);
-const SLOW_MAX_ROTATIONS = envInt("SLOW_MAX_ROTATIONS", 2);
 const CONTAINER_PREFIX = process.env.CONTAINER_PREFIX ?? "warp-relay-warp-";
-const READY_TIMEOUT_MS = envInt("READY_TIMEOUT_MS", 180_000, { min: 1 });
 const PROBE_TIMEOUT_MS = envInt("PROBE_TIMEOUT_MS", 30_000, { min: 1 });
-const MAX_ROTATIONS = envInt("MAX_ROTATIONS", 4, { min: 1 });
 const ROTATE_CONCURRENCY = envInt("ROTATE_CONCURRENCY", 1, { min: 1, max: 64 });
 const SERVER_ERROR_RETRY = envInt("SERVER_ERROR_RETRY", 1);
 const SERVER_ERROR_REPROBE_MS = envInt("SERVER_ERROR_REPROBE_MS", 5_000);
 const SERVER_ERROR_GUARD = Math.min(envInt("SERVER_ERROR_GUARD", 9, { min: 1 }), COUNT);
 const INTERVAL_S = envInt("INTERVAL_S", 300, { min: 1 });
 const TIER2_MIN_INTERVAL_S = envInt("TIER2_MIN_INTERVAL_S", 3600);
-const TIER2_STATE_FILE = process.env.TIER2_STATE_FILE ?? ".keep-cold/tier2-state.json";
+
+// ── Demand-driven scheduling knobs ──────────────────────────────────
+const RELAY_STATE_FILE = envFile("RELAY_STATE_FILE", ".keep-cold/state.json");
+const LIVE_SIGNAL_FILE = envFile("LIVE_SIGNAL_FILE", ".keep-cold/signals.json");
+const TIER2_STATE_FILE = envFile("TIER2_STATE_FILE", ".keep-cold/tier2-state.json");
+const RELAY_COOLDOWN_S = envInt("RELAY_COOLDOWN_S", 600);
+const RELAY_BACKOFF_BASE_S = envInt("RELAY_BACKOFF_BASE_S", 300, { min: 1 });
+const RELAY_BACKOFF_MAX_S = envInt("RELAY_BACKOFF_MAX_S", 3600, { min: 1 });
+const RELAY_MAX_ROTATIONS_PER_HOUR = envInt("RELAY_MAX_ROTATIONS_PER_HOUR", 2, { min: 1 });
+const PROBE_AUDIT_SAMPLE = envInt("PROBE_AUDIT_SAMPLE", 2, { min: 0, max: COUNT });
+const EGRESS_SETTLE_S = envInt("EGRESS_SETTLE_S", 150);
+const ROTATE_SPACING_MS = envInt("ROTATE_SPACING_MS", 4000);
+const LIVE_SIGNALS = envInt("LIVE_SIGNALS", 0, { min: 0, max: 1 }) === 1;
+const PROBE_CONCURRENCY = envInt("PROBE_CONCURRENCY", 4, { min: 1, max: 64 });
+const CLOCK_SKEW_S = envInt("KEEP_COLD_CLOCK_SKEW_S", 0, { min: -Number.MAX_SAFE_INTEGER });
+const DOCKER_BIN = envFile("DOCKER_BIN", "docker");
+const DOCKER_PREFIX_ARGS = (process.env.DOCKER_PREFIX_ARGS ?? "").split(/\s+/).filter(Boolean);
+
+// Accepted for backwards compatibility with installed unit files, then
+// ignored: this controller no longer waits for readiness or verifies a
+// rotation inline. Parsed (not just read) so a broken unit file still fails
+// fast instead of silently changing behaviour.
+envInt("READY_TIMEOUT_MS", 180_000, { min: 1 });
+envInt("SOCKS_PORT_BASE", 10800, { min: 1, max: 65535 });
+envInt("MAX_ROTATIONS", 4, { min: 1 });
+envInt("SLOW_MAX_ROTATIONS", 2);
+
+/**
+ * Every state timestamp, comparison and log-visible decision runs on now().
+ * KEEP_COLD_CLOCK_SKEW_S exists so tests can walk a scenario forward in time
+ * without touching the state file.
+ */
+function now() {
+ return Date.now() + CLOCK_SKEW_S * 1000;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Short single-line reason for state-file diagnostics. */
+function shortReason(e) {
+ return String(e?.message ?? e ?? "unknown").replace(/\s+/g, " ").trim().slice(0, 80);
+}
 
 // ── Upstream fingerprint ────────────────────────────────────────────
 // Historically OpenCode's free tier rejected requests that did not look like
@@ -345,13 +429,160 @@ function log(msg) {
  }
 }
 
+// ── Per-relay state ─────────────────────────────────────────────────
+// State is an optimisation: every read/write path degrades to the baseline
+// full sweep instead of failing the pass.
+let passBrokenStateLogged = false;
+let passWriteFailureLogged = false;
+
+function logBrokenStateOnce(reason) {
+ if (passBrokenStateLogged) return;
+ passBrokenStateLogged = true;
+ log(`state file unusable (${reason}) — full sweep`);
+}
+
+function logWriteFailureOnce(reason) {
+ if (passWriteFailureLogged) return;
+ passWriteFailureLogged = true;
+ log(`state file write failed (${reason}) — continuing`);
+}
+
+function emptyState() {
+ return { version: 1, auditCursor: 0, relays: {} };
+}
+
+/** Read + shape-check the state file. Throws on anything unusable. */
+function readStateFile() {
+ const raw = fs.readFileSync(RELAY_STATE_FILE, "utf8");
+ const parsed = JSON.parse(raw);
+ if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+ const relays = parsed.relays && typeof parsed.relays === "object" && !Array.isArray(parsed.relays)
+  ? parsed.relays
+  : {};
+ const auditCursor = Number.isFinite(parsed.auditCursor) ? parsed.auditCursor : 0;
+ return { version: 1, auditCursor, relays };
+}
+
+function loadState() {
+ try {
+  return readStateFile();
+ } catch (e) {
+  // ENOENT is the documented first run, not a broken file.
+  if (e?.code !== "ENOENT") logBrokenStateOnce(e?.code ?? shortReason(e));
+  return emptyState();
+ }
+}
+
+function num(v) {
+ return Number.isFinite(v) ? v : 0;
+}
+
+/** One relay's state with every field defaulted. */
+function relayEntry(state, index) {
+ const raw = state.relays?.[String(index)];
+ const e = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+ const last429 = e.last429 && typeof e.last429 === "object" ? e.last429 : {};
+ return {
+  lastProbe: num(e.lastProbe),
+  lastClean: num(e.lastClean),
+  lastRotate: num(e.lastRotate),
+  consecutiveFailures: num(e.consecutiveFailures),
+  cooldownUntil: num(e.cooldownUntil),
+  probeAfter: num(e.probeAfter),
+  dirty: e.dirty === true,
+  pendingVerify: e.pendingVerify === true,
+  last429: { model: typeof last429.model === "string" ? last429.model : "", ts: num(last429.ts) },
+  rotations: Array.isArray(e.rotations) ? e.rotations.map(num).filter((t) => t > 0) : [],
+ };
+}
+
+/** Restart stamps are kept for the rolling-hour budget only. */
+function pruneRotations(rotations, at) {
+ const cutoff = at - 3_600_000;
+ return rotations.filter((ts) => ts > cutoff).slice(-64);
+}
+
+/**
+ * Merge-on-write: re-read the file, patch one relay (or the audit cursor), then
+ * tmp+rename. Concurrent writers therefore cannot erase each other's stamps.
+ */
+function writeState(mutator, suffix) {
+ try {
+  fs.mkdirSync(path.dirname(RELAY_STATE_FILE), { recursive: true });
+  let fresh;
+  try {
+   fresh = readStateFile();
+  } catch {
+   fresh = emptyState();
+  }
+  mutator(fresh);
+  fresh.version = 1;
+  const tmp = `${RELAY_STATE_FILE}.${process.pid}.${suffix}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(fresh));
+  fs.renameSync(tmp, RELAY_STATE_FILE);
+ } catch (e) {
+  logWriteFailureOnce(shortReason(e));
+ }
+}
+
+/** Patch one relay in memory and on disk; returns the merged entry. */
+function patchRelay(state, index, patch) {
+ const merged = { ...relayEntry(state, index), ...patch };
+ merged.rotations = pruneRotations(merged.rotations, now());
+ state.relays[String(index)] = merged;
+ writeState((fresh) => {
+  const next = { ...relayEntry(fresh, index), ...patch };
+  next.rotations = pruneRotations(next.rotations, now());
+  fresh.relays[String(index)] = next;
+ }, String(index));
+ return merged;
+}
+
+function saveAuditCursor(cursor) {
+ writeState((fresh) => {
+  fresh.auditCursor = cursor;
+ }, "audit");
+}
+
+// ── Live signals ────────────────────────────────────────────────────
+/**
+ * Read and consume LIVE_SIGNAL_FILE: server.mjs appends one record per state
+ * change, this controller rewrites the file as {"signals":[]} so no record is
+ * processed twice. Missing/corrupt file = no signals, no log line.
+ */
+function readSignals() {
+ let raw;
+ try {
+  raw = fs.readFileSync(LIVE_SIGNAL_FILE, "utf8");
+ } catch {
+  return null;
+ }
+ let parsed;
+ try {
+  parsed = JSON.parse(raw);
+ } catch {
+  return null;
+ }
+ const list = Array.isArray(parsed?.signals) ? parsed.signals : null;
+ if (!list) return null;
+ try {
+  fs.mkdirSync(path.dirname(LIVE_SIGNAL_FILE), { recursive: true });
+  const tmp = `${LIVE_SIGNAL_FILE}.${process.pid}.signals.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ signals: [] }));
+  fs.renameSync(tmp, LIVE_SIGNAL_FILE);
+ } catch {
+  // Consuming is best effort; a leftover record is re-read next pass.
+ }
+ return list.filter((s) => s && Number.isInteger(s.relay) && s.relay >= 1 && s.relay <= COUNT);
+}
+
 // ── Docker helpers ──────────────────────────────────────────────────
 function containerName(index) {
  return `${CONTAINER_PREFIX}${index}`;
 }
 
 async function docker(args, timeout = 30_000) {
- const { stdout } = await execFileAsync("docker", args, {
+ const { stdout } = await execFileAsync(DOCKER_BIN, [...DOCKER_PREFIX_ARGS, ...args], {
   encoding: "utf8",
   timeout,
   maxBuffer: 4 * 1024 * 1024,
@@ -359,43 +590,24 @@ async function docker(args, timeout = 30_000) {
  return stdout;
 }
 
-/** True when the WARP client egresses with WARP on (host-side SOCKS check). */
-async function warpReady(index) {
- try {
-  // MicroWARP has no warp-cli and no guaranteed curl — check from the deploy
-  // host via SOCKS instead of docker-exec.
-  const { stdout } = await execFileAsync(
-   "curl",
-   ["-s", "-m", "10", "-x", `socks5h://${SOCKS_HOST}:${SOCKS_PORT_BASE + index}`, "https://cloudflare.com/cdn-cgi/trace"],
-   { encoding: "utf8", timeout: 15_000 },
-  );
-  return /^ip=/m.test(stdout) && /warp=on/m.test(stdout);
- } catch {
-  return false;
- }
-}
+// ONE serialisation chain for every restart operation (tier-1, tier-2,
+// 502/server_error): consecutive operations start at least ROTATE_SPACING_MS
+// apart, no matter which phase queued them.
+let restartChain = Promise.resolve();
+let lastRestartAt = 0;
 
-/** Egress address of a relay, for the log line. */
-async function egressIp(index) {
- try {
-  // MicroWARP has no docker-exec curl — probe from the deploy host via SOCKS.
-  const { stdout } = await execFileAsync(
-   "curl",
-   ["-s", "-m", "10", "-x", `socks5h://${SOCKS_HOST}:${SOCKS_PORT_BASE + index}`, "https://cloudflare.com/cdn-cgi/trace"],
-   { encoding: "utf8", timeout: 15_000 },
-  );
-  return (stdout.match(/^ip=(.+)$/m)?.[1] ?? "?").trim();
- } catch {
-  return "?";
- }
-}
-
-async function waitReady(index, deadline) {
- while (Date.now() < deadline) {
-  if (await warpReady(index)) return true;
-  await new Promise((r) => setTimeout(r, 4_000));
- }
- return false;
+function enqueueRestart(work) {
+ const next = restartChain.then(async () => {
+  if (lastRestartAt > 0) {
+   const gap = ROTATE_SPACING_MS - (now() - lastRestartAt);
+   if (gap > 0) await sleep(gap);
+  }
+  lastRestartAt = now();
+  return work();
+ });
+ // A failed operation must not poison the chain for the next relay.
+ restartChain = next.then(() => { }, () => { });
+ return next;
 }
 
 /** Matches both server_error shapes: transport JSON and 200-SSE envelope. */
@@ -409,8 +621,8 @@ function isServerError(status, detail) {
 
 /**
  * Read at most the first 2 SSE chunks (~4KB cap) of a 200 body, then cancel.
- * Envelope-shape server_error hides inside 200 streams, which the old
- * cancel-unread probe counted as clean.
+ * Envelope-shape server_error hides inside 200 streams, which a
+ * cancel-unread probe would count as clean.
  */
 async function readEnvelopeHead(res) {
  const reader = res.body?.getReader?.();
@@ -463,7 +675,10 @@ async function probe(index, model) {
   }
   const text = await res.text().catch(() => "");
   const detail = text.replace(/\s+/g, " ").slice(0, 160);
-  return { index, model, status: res.status, serverError: isServerError(res.status, detail), detail, ms: Date.now() - t0 };
+  // Numeric Retry-After only; an HTTP-date header is left to the gate.
+  const raRaw = res.status === 429 ? res.headers.get("retry-after") : null;
+  const retryAfter = raRaw && /^\d+$/.test(raRaw.trim()) ? Number(raRaw.trim()) : null;
+  return { index, model, status: res.status, serverError: isServerError(res.status, detail), detail, retryAfter, ms: Date.now() - t0 };
  } catch (e) {
   return { index, model, status: 0, serverError: false, detail: String(e?.message ?? e).slice(0, 160), ms: Date.now() - t0 };
  }
@@ -476,9 +691,9 @@ async function probeRelay(index, models = PROBE_MODELS) {
  return out;
 }
 
-// Tier-2 spends a Cloudflare registration. One per relay per pass is the
-// budget; the state file keeps a stuck relay from re-spending it on every
-// 5-minute timer tick.
+// Tier-2 spends a Cloudflare registration. One per relay per TIER2_MIN_INTERVAL_S
+// is the budget; the state file keeps a stuck relay from re-spending it on
+// every timer tick.
 function loadTier2State() {
  try {
   return JSON.parse(fs.readFileSync(TIER2_STATE_FILE, "utf8")) ?? {};
@@ -501,170 +716,9 @@ function saveTier2State(index, stamp) {
  }
 }
 
-function tier2Allowed(index, state) {
+function tier2Allowed(index, tier2State = loadTier2State()) {
  if (TIER2_MIN_INTERVAL_S === 0) return true;
- return Date.now() - Number(state[index] ?? 0) >= TIER2_MIN_INTERVAL_S * 1000;
-}
-
-/**
- * Restart the WARP client container until every given model answers 200
- * (and, when `speed` is set, the speed model answers within threshold).
- * 429 path uses MAX_ROTATIONS; speed-only retries use SLOW_MAX_ROTATIONS.
- * Two-tier: tier 1 (t1) plain restart, tier 2 (t2) exec-wipe of wg0.conf +
- * restart at most once per relay per pass (and not again for
- * TIER2_MIN_INTERVAL_S). Nodes without wg0.conf skip tier 2.
- */
-async function rotateUntilClean(index, models, speed = null) {
- const maxAttempts = speed ? SLOW_MAX_ROTATIONS : MAX_ROTATIONS;
- const tier2State = loadTier2State();
- let rekeys = 0;
- let latestFailing = null;
- for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-  log(`#${index} rotating egress (attempt ${attempt}/${maxAttempts} t1) — restarting ${containerName(index)}`);
-  try {
-   // Tier 1: plain restart - same account, fresh egress /64. Cheap, zero
-   // registration-quota cost; clears per-egress-IP throttles.
-   await docker(["restart", containerName(index)], 60_000);
-  } catch (e) {
-   log(`#${index} restart failed: ${String(e?.message ?? e).slice(0, 120)}`);
-   continue;
-  }
-  const ready = await waitReady(index, Date.now() + READY_TIMEOUT_MS);
-  if (!ready) {
-   log(`#${index} WARP client did not come up within ${Math.round(READY_TIMEOUT_MS / 1000)}s`);
-   continue;
-  }
-  const results = await probeRelay(index, models);
-  const failing = results.filter((r) => r.status !== 200 || r.serverError);
-  latestFailing = failing;
-  if (failing.length === 0) {
-   if (speed) {
-    const t = results.find((r) => r.model === speed.model)?.ms ?? Infinity;
-    if (t <= speed.threshold) {
-     log(`#${index} fast on ${models.length} model(s) (${speed.model} ${t}ms) — new egress ${await egressIp(index)}`);
-     return true;
-    }
-    log(`#${index} still slow after rotation: ${speed.model} ${t}ms > ${speed.threshold}ms`);
-    continue;
-   }
-   log(`#${index} clean on ${models.length} model(s) — new egress ${await egressIp(index)}`);
-   return true;
-  }
-  // Tier 2: tier 1 did not clear it - re-key with a fresh registration (new
-  // account/keys). Spends one Cloudflare registration; clears per-account
-  // throttles. Nodes without wg0.conf (e.g. caomingjun) are not re-keyable:
-  // abort the re-key instead of forcing a wipe.
-  if (rekeys >= 1) {
-   log(`#${index} tier-2 budget spent this pass — holding for the next pass`);
-   latestFailing = failing;
-   continue;
-  }
-  if (!tier2Allowed(index, tier2State)) {
-   const nextIn = Math.max(0, Math.ceil((TIER2_MIN_INTERVAL_S * 1000 - (Date.now() - Number(tier2State[index] ?? 0))) / 1000));
-   log(`#${index} tier-2 re-key deferred (last re-key < ${TIER2_MIN_INTERVAL_S}s ago; next in ~${nextIn}s)`);
-   latestFailing = failing;
-   continue;
-  }
-  rekeys++;
-  const tier2Stamp = Date.now();
-  tier2State[index] = tier2Stamp;
-  saveTier2State(index, tier2Stamp);
-  log(`#${index} rotating egress (attempt ${attempt}/${maxAttempts} t2) — re-keying ${containerName(index)}`);
-  let rekeyable = true;
-  try {
-   await docker(["exec", containerName(index), "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
-  } catch {
-   rekeyable = false;
-  }
-  if (!rekeyable) {
-   log(`#${index} tier-2 aborted: no /etc/wireguard/wg0.conf — leaving registration untouched`);
-  } else {
-   try {
-    await docker(["exec", containerName(index), "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
-    await docker(["restart", containerName(index)], 60_000);
-   } catch (e) {
-    log(`#${index} restart failed: ${String(e?.message ?? e).slice(0, 120)}`);
-    continue;
-   }
-   const ready2 = await waitReady(index, Date.now() + READY_TIMEOUT_MS);
-   if (!ready2) {
-    log(`#${index} WARP client did not come up within ${Math.round(READY_TIMEOUT_MS / 1000)}s`);
-    continue;
-   }
-   const results2 = await probeRelay(index, models);
-   const failing2 = results2.filter((r) => r.status !== 200 || r.serverError);
-   latestFailing = failing2;
-   if (failing2.length === 0) {
-    if (speed) {
-     const t2 = results2.find((r) => r.model === speed.model)?.ms ?? Infinity;
-     if (t2 <= speed.threshold) {
-      log(`#${index} fast on ${models.length} model(s) (${speed.model} ${t2}ms) — new egress ${await egressIp(index)}`);
-      return true;
-     }
-     log(`#${index} still slow after rotation: ${speed.model} ${t2}ms > ${speed.threshold}ms`);
-     continue;
-    }
-    log(`#${index} clean on ${models.length} model(s) — new egress ${await egressIp(index)}`);
-    return true;
-   }
-  }
-  log(`#${index} still failing after rotation: ${(latestFailing ?? failing).map((r) => `${r.model}=${r.status || "unreachable"}`).join(", ")}`);
- }
- log(`#${index} GAVE UP after ${maxAttempts} rotations`);
- return false;
-}
-
-/**
- * Single tier-1 restart for the server_error path: plain restart (same
- * account, fresh egress /64 — zero registration cost), then re-probe.
- * NEVER tier-2 here: a server_error rotation must not spend Cloudflare
- * registrations, so a still-failing relay holds instead of re-keying.
- */
-async function rotateTier1Once(index, models) {
- log(`#${index} rotating egress (t1 server_error) — restarting ${containerName(index)}`);
- try {
-  await docker(["restart", containerName(index)], 60_000);
- } catch (e) {
-  log(`#${index} restart failed: ${String(e?.message ?? e).slice(0, 120)}`);
-  return false;
- }
- const ready = await waitReady(index, Date.now() + READY_TIMEOUT_MS);
- if (!ready) {
-  log(`#${index} WARP client did not come up within ${Math.round(READY_TIMEOUT_MS / 1000)}s`);
-  return false;
- }
- const results = await probeRelay(index, models);
- const failing = results.filter((r) => r.status !== 200 || r.serverError);
- if (failing.length === 0) {
-  log(`#${index} clean on ${models.length} model(s) — new egress ${await egressIp(index)}`);
-  return true;
- }
- log(`#${index} still failing after t1: ${failing.map((r) => `${r.model}=${r.serverError ? "server_error" : (r.status || "unreachable")}`).join(", ")}`);
- return false;
-}
-
-/**
- * server_error handling for one relay: same-egress re-probe(s) first
- * (stateless transient filter), then at most ONE tier-1 restart.
- * Returns { recovered, restarted }.
- */
-async function handleServerError(index, models) {
- for (let a = 0; a < SERVER_ERROR_RETRY; a++) {
-  await new Promise((r) => setTimeout(r, SERVER_ERROR_REPROBE_MS));
-  const retry = [];
-  for (const m of models) retry.push(await probe(index, m));
-  const still = retry.filter((r) => r.status !== 200 || r.serverError);
-  for (const r of retry) {
-   if (r.status === 200 && !r.serverError) log(`#${index} ${r.model} server_error transient - re-probe clean`);
-  }
-  if (still.length === 0) return { recovered: true, restarted: false };
-  if (a < SERVER_ERROR_RETRY - 1) continue;
-  const ok = await rotateTier1Once(index, still.map((r) => r.model));
-  if (ok) return { recovered: true, restarted: true };
-  for (const r of still) log(`#${index} ${r.model} still server_error after t1 - holding, no tier-2`);
-  return { recovered: false, restarted: true };
- }
- return { recovered: false, restarted: false };
+ return now() - Number(tier2State[index] ?? 0) >= TIER2_MIN_INTERVAL_S * 1000;
 }
 
 /** Run `worker` over `items` with bounded concurrency. */
@@ -680,170 +734,513 @@ async function runPool(items, limit, worker) {
  await Promise.all(runners);
 }
 
+// ── Rotation budget ─────────────────────────────────────────────────
+/** Exponential cooldown for the n-th consecutive failing batch. */
+function effectiveCooldown(n) {
+ const base = RELAY_BACKOFF_BASE_S * 1000 * 2 ** Math.max(0, n - 1);
+ return Math.max(RELAY_COOLDOWN_S * 1000, Math.min(base, RELAY_BACKOFF_MAX_S * 1000));
+}
+
+function rotationsWithinHour(entry, at) {
+ return entry.rotations.filter((ts) => at - ts < 3_600_000);
+}
+
+/**
+ * The rotation gate: cooldown, minimum gap between rotations, settle window,
+ * rolling-hour budget. `allowed: false` carries the exact reason the pass logs.
+ */
+function gate(entry, at) {
+ const cooldown = entry.cooldownUntil - at;
+ if (cooldown > 0) return { allowed: false, reason: `cooldown ${Math.ceil(cooldown / 1000)}s remaining` };
+ const gap = RELAY_COOLDOWN_S * 1000 - (at - entry.lastRotate);
+ if (gap > 0) return { allowed: false, reason: `cooldown ${Math.ceil(gap / 1000)}s remaining` };
+ if (at < entry.lastRotate + EGRESS_SETTLE_S * 1000) return { allowed: false, reason: "settle window" };
+ const recent = rotationsWithinHour(entry, at);
+ if (recent.length >= RELAY_MAX_ROTATIONS_PER_HOUR) {
+  return { allowed: false, reason: `hourly budget ${recent.length}/${RELAY_MAX_ROTATIONS_PER_HOUR}` };
+ }
+ return { allowed: true };
+}
+
+/**
+ * Perform one rotation through the spacing chain, then record it. There is no
+ * readiness wait and no verification probe here: the settle window plus
+ * pendingVerify make a later pass the verifier.
+ */
+async function runRotation(job, state, dirty) {
+ const container = containerName(job.index);
+ const at = await enqueueRestart(async () => {
+  const started = now();
+  if (job.tier2) {
+   let rekeyable = true;
+   try {
+    await docker(["exec", container, "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+   } catch {
+    rekeyable = false;
+   }
+   if (!rekeyable) {
+    log(`#${job.index} tier-2 aborted: no /etc/wireguard/wg0.conf — leaving registration untouched`);
+    log(`#${job.index} rotating egress (t1) — restarting ${container}`);
+    try {
+     await docker(["restart", container], 60_000);
+    } catch (e) {
+     log(`#${job.index} restart failed: ${shortReason(e)}`);
+    }
+    return started;
+   }
+   log(`#${job.index} rotating egress (t2) — re-keying ${container}`);
+   try {
+    await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+    await docker(["restart", container], 60_000);
+   } catch (e) {
+    log(`#${job.index} restart failed: ${shortReason(e)}`);
+   }
+   saveTier2State(job.index, started);
+   return started;
+  }
+  log(`#${job.index} rotating egress (t1) — restarting ${container}`);
+  try {
+   await docker(["restart", container], 60_000);
+  } catch (e) {
+   log(`#${job.index} restart failed: ${shortReason(e)}`);
+  }
+  return started;
+ });
+ const entry = relayEntry(state, job.index);
+ const patch = {
+  lastRotate: at,
+  dirty: true,
+  pendingVerify: job.verify !== false,
+  lastProbe: at,
+  probeAfter: at + EGRESS_SETTLE_S * 1000,
+  cooldownUntil: at + effectiveCooldown(job.n),
+  rotations: [...entry.rotations, at],
+  consecutiveFailures: job.n,
+ };
+ if (job.model) patch.last429 = { model: job.model, ts: at };
+ patchRelay(state, job.index, patch);
+ dirty.add(job.index);
+}
+
+// ── Suspect selection ───────────────────────────────────────────────
+/**
+ * Demand-driven suspect list: pendingVerify relays past their settle window,
+ * dirty relays whose probeAfter expired, plus one round-robin audit sample of
+ * clean relays. Baseline (no state yet) selects everything.
+ */
+function selectSuspects(state, { baseline, excluded }) {
+ const at = now();
+ const selected = new Set();
+ const audit = [];
+ if (baseline) {
+  // A live signal already names a relay: probing it in the same pass would
+  // waste a request and could race the restart it is about to get.
+  for (let i = 1; i <= COUNT; i++) if (!excluded.has(i)) selected.add(i);
+  return { selected, audit };
+ }
+ for (let i = 1; i <= COUNT; i++) {
+  if (excluded.has(i)) continue;
+  const e = relayEntry(state, i);
+  if (e.pendingVerify && at >= e.lastRotate + EGRESS_SETTLE_S * 1000) {
+   selected.add(i);
+   continue;
+  }
+  if (e.dirty && at >= e.probeAfter) selected.add(i);
+ }
+ const cursor = Number.isInteger(state.auditCursor) ? state.auditCursor : 0;
+ let nextCursor = cursor;
+ for (let k = 1; k <= COUNT && audit.length < PROBE_AUDIT_SAMPLE; k++) {
+  const index = ((cursor + k - 1) % COUNT) + 1;
+  if (selected.has(index) || excluded.has(index)) continue;
+  const e = relayEntry(state, index);
+  if (e.dirty || e.pendingVerify) continue;
+  if (at < e.lastRotate + EGRESS_SETTLE_S * 1000) continue;
+  audit.push(index);
+  selected.add(index);
+  nextCursor = index;
+ }
+ if (audit.length) saveAuditCursor(nextCursor);
+ return { selected, audit };
+}
+
+// ── Result handling ─────────────────────────────────────────────────
+function cleanPatch() {
+ return {
+  lastProbe: now(),
+  lastClean: now(),
+  dirty: false,
+  pendingVerify: false,
+  consecutiveFailures: 0,
+  cooldownUntil: 0,
+  probeAfter: 0,
+  // A relay that answers 200 on every probed model is no longer evidence for
+  // the pool-wide quota history; leaving the stamp would cap a model for 900 s
+  // after the pool recovered.
+  last429: { model: "", ts: 0 },
+ };
+}
+
+function markClean(ctx, index) {
+ patchRelay(ctx.state, index, cleanPatch());
+ ctx.dirty.delete(index);
+}
+
+/** Same-egress transient filter for server_error results, before the gate. */
+async function reProbeServerErrors(index, failed) {
+ let left = failed;
+ for (let round = 0; round < SERVER_ERROR_RETRY && left.length > 0; round++) {
+  if (SERVER_ERROR_REPROBE_MS > 0) await sleep(SERVER_ERROR_REPROBE_MS);
+  const next = [];
+  for (const r of left) {
+   const again = await probe(index, r.model);
+   if (again.status === 200 && !again.serverError) {
+    log(`#${index} ${r.model} server_error transient - re-probe clean`);
+   } else {
+    next.push(again);
+   }
+  }
+  left = next;
+ }
+ return left;
+}
+
+/** Classify one relay's probe batch: patch state, or queue a rotation. */
+async function classifyRelay(index, results, ctx) {
+ const at = now();
+ const failing = results.filter((r) => r.status !== 200 || r.serverError);
+ if (failing.length === 0) {
+  markClean(ctx, index);
+  return;
+ }
+
+ const capped = [];
+ const srvErr = [];
+ const hot = [];
+ const gateway = [];
+ const other = [];
+ for (const r of failing) {
+  if (r.serverError) {
+   if (ctx.serverErrCapped.has(r.model)) capped.push(r);
+   else srvErr.push(r);
+   continue;
+  }
+  if (r.status === 429) {
+   if (ctx.quotaCapped.has(r.model)) capped.push(r);
+   else hot.push(r);
+   continue;
+  }
+  if (r.status === 502) {
+   gateway.push(r);
+   continue;
+  }
+  other.push(r);
+ }
+
+ const seLeft = srvErr.length ? await reProbeServerErrors(index, srvErr) : [];
+ for (const r of seLeft) {
+  const evt = r.status === 200
+   ? (/response\.failed/i.test(r.detail) ? "response.failed" : /failed to generate/i.test(r.detail) ? "failed to generate" : "server_error")
+   : null;
+  if (evt) log(`#${index} ${r.model} server_error in 200 envelope (SSE ${evt})`);
+  else log(`#${index} ${r.model} server_error HTTP ${r.status}`);
+ }
+ if (hot.length) ctx.hotRelays.set(index, hot.map((r) => r.model));
+ if (seLeft.length) ctx.seRelays.set(index, seLeft.map((r) => r.model));
+
+ const entry = relayEntry(ctx.state, index);
+ const n = entry.consecutiveFailures + 1;
+ const rotatable = [...seLeft, ...hot, ...gateway];
+
+ if (rotatable.length === 0 && capped.length === 0 && other.length === 0) {
+  // Only transient server_errors failed: the re-probe proved them gone.
+  markClean(ctx, index);
+  return;
+ }
+
+ // The host or the relay app is unhealthy: restarting WARP cannot help, so
+ // this keeps the "cannot reach the relay" non-rotation path.
+ if (other.length) {
+  for (const r of other) log(`#${index} ${r.model} unexpected HTTP ${r.status || "unreachable"} — ${r.detail}`);
+  ctx.dirty.add(index);
+  patchRelay(ctx.state, index, {
+   dirty: true,
+   lastProbe: at,
+   pendingVerify: false,
+   probeAfter: at + RELAY_COOLDOWN_S * 1000,
+   consecutiveFailures: n,
+  });
+  return;
+ }
+
+ if (rotatable.length === 0) {
+  // Failing only on models the guards call upstream quota / incident.
+  ctx.cappedOnly.push(index);
+  ctx.dirty.add(index);
+  patchRelay(ctx.state, index, {
+   dirty: true,
+   lastProbe: at,
+   pendingVerify: false,
+   probeAfter: at + RELAY_COOLDOWN_S * 1000,
+   consecutiveFailures: n,
+  });
+  return;
+ }
+
+ // Honour Retry-After instead of restarting: schedule the next probe.
+ const retryAfter = hot.filter((r) => Number.isFinite(r.retryAfter) && r.retryAfter >= 0 && r.retryAfter <= 120);
+ if (retryAfter.length) {
+  const waitS = Math.max(...retryAfter.map((r) => r.retryAfter));
+  ctx.dirty.add(index);
+  patchRelay(ctx.state, index, {
+   dirty: true,
+   lastProbe: at,
+   last429: { model: retryAfter[0].model, ts: at },
+   probeAfter: at + waitS * 1000,
+   consecutiveFailures: n,
+   pendingVerify: false,
+  });
+  log(`#${index} retry-after ${waitS}s — scheduling, no restart`);
+  return;
+ }
+
+ const verdict = gate(entry, at);
+ if (verdict.allowed) {
+  ctx.dirty.add(index);
+  // Tier-2 spends a registration: only for pure 429 batches, and only for a
+  // relay that has already been restarted at least once.
+  const pure429 = hot.length > 0 && seLeft.length === 0 && gateway.length === 0;
+  ctx.rotations.push({
+   index,
+   n,
+   tier2: entry.lastRotate > 0 && pure429 && tier2Allowed(index),
+   model: hot[0]?.model ?? seLeft[0]?.model ?? gateway[0]?.model ?? null,
+  });
+  return;
+ }
+
+ ctx.dirty.add(index);
+ const patch = {
+  dirty: true,
+  lastProbe: at,
+  pendingVerify: false,
+  probeAfter: Math.max(entry.cooldownUntil, at + EGRESS_SETTLE_S * 1000),
+  consecutiveFailures: n,
+ };
+ if (hot.length) patch.last429 = { model: hot[0].model, ts: at };
+ patchRelay(ctx.state, index, patch);
+ log(`#${index} held: ${verdict.reason}`);
+}
+
+/** A live 429 signal: same gate, no probe. */
+function classifySignal(index, model, ctx) {
+ const at = now();
+ const entry = relayEntry(ctx.state, index);
+ const n = entry.consecutiveFailures + 1;
+ if (model) ctx.hotRelays.set(index, [model]);
+ // A model the guards call upstream quota/incident cannot be fixed by an
+ // egress change: touching every signalled relay would be the exact churn
+ // this scheduler exists to prevent.
+ if (model && (ctx.quotaCapped.has(model) || ctx.serverErrCapped.has(model))) {
+  ctx.cappedOnly.push(index);
+  ctx.dirty.add(index);
+  patchRelay(ctx.state, index, {
+   dirty: true,
+   pendingVerify: false,
+   probeAfter: at + RELAY_COOLDOWN_S * 1000,
+   consecutiveFailures: n,
+   last429: { model, ts: at },
+  });
+  return;
+ }
+ const verdict = gate(entry, at);
+ if (verdict.allowed) {
+  ctx.dirty.add(index);
+  ctx.rotations.push({
+   index,
+   n,
+   tier2: entry.lastRotate > 0 && tier2Allowed(index),
+   model: model || null,
+  });
+  return;
+ }
+ ctx.dirty.add(index);
+ patchRelay(ctx.state, index, {
+  dirty: true,
+  pendingVerify: false,
+  probeAfter: Math.max(entry.cooldownUntil, at + EGRESS_SETTLE_S * 1000),
+  consecutiveFailures: n,
+  ...(model ? { last429: { model, ts: at } } : {}),
+ });
+ log(`#${index} held: ${verdict.reason}`);
+}
+
 // ── One pass ────────────────────────────────────────────────────────
+function countByModel(results, predicate) {
+ const counts = new Map();
+ for (const r of results) {
+  if (!predicate(r)) continue;
+  counts.set(r.model, (counts.get(r.model) ?? 0) + 1);
+ }
+ return counts;
+}
+
 async function pass() {
- log(`probing ${COUNT} relay(s) x ${PROBE_MODELS.length} model(s) via ${RELAY_HOST}:${BASE_PORT + 1}..${BASE_PORT + COUNT}`);
- const perRelay = await Promise.all(
-  Array.from({ length: COUNT }, (_, k) => probeRelay(k + 1)),
- );
- const results = perRelay.flat();
+ passBrokenStateLogged = false;
+ passWriteFailureLogged = false;
+
+ const state = loadState();
+ const baseline = Object.keys(state.relays).length === 0;
+ const dirty = new Set();
+ for (let i = 1; i <= COUNT; i++) if (relayEntry(state, i).dirty) dirty.add(i);
+
+ // ── live signals (phase 2 input, off by default) ──
+ const signalHot = new Map();
+ if (LIVE_SIGNALS) {
+  const signals = readSignals();
+  if (signals) {
+   for (const sig of signals) {
+    const index = sig.relay;
+    if (Number(sig.status) === 429) {
+     const model = typeof sig.model === "string" ? sig.model : "";
+     if (!signalHot.has(index)) signalHot.set(index, model);
+     // Feed last429 so the quota guard sees live traffic too.
+     patchRelay(state, index, { dirty: true, last429: { model, ts: now() } });
+     dirty.add(index);
+    } else {
+     patchRelay(state, index, cleanPatch());
+     dirty.delete(index);
+    }
+   }
+  }
+ }
+
+ const { selected, audit } = selectSuspects(state, { baseline, excluded: new Set(signalHot.keys()) });
+ const suspects = [...selected].sort((a, b) => a - b);
+ log(`probing ${suspects.length} of ${COUNT} relay(s) x ${PROBE_MODELS.length} model(s) via ${RELAY_HOST}:${BASE_PORT + 1}..${BASE_PORT + COUNT}${baseline ? " (baseline)" : ""}`);
+ if (audit.length) log(`audit sample: ${audit.map((i) => `#${i}`).join(" ")}`);
+
+ const probed = new Map();
+ await runPool(suspects, PROBE_CONCURRENCY, async (index) => {
+  probed.set(index, await probeRelay(index, PROBE_MODELS));
+ });
+ const all = [...probed.values()].flat();
 
  // Latency ranking on the speed model (200s only) — same prompt, same
  // minute, so spread here is egress quality, not upstream mood.
- // Envelope-200s carrying server_error are failures, not timings.
- const speedRows = results
+ const speedRows = all
   .filter((r) => r.model === SPEED_MODEL && r.status === 200 && !r.serverError)
   .sort((a, b) => a.ms - b.ms);
  if (speedRows.length) {
   log(`speed ${SPEED_MODEL}: ` + speedRows.map((r) => `#${r.index} ${r.ms}ms`).join(" "));
  }
 
- // Global-quota guard: a model 429ing on a majority of relays is upstream
- // model quota — no egress rotation can fix it, so skip it for rotation
- // decisions this pass instead of churning every WARP client.
- const throttledCount = new Map(); // model -> relays answering 429
- for (const r of results) {
-  if (r.status === 429) throttledCount.set(r.model, (throttledCount.get(r.model) ?? 0) + 1);
+ // Global-quota guard: observed this pass OR carried in state (900 s window) —
+ // a model throttled on a majority of relays is upstream model quota and no
+ // egress rotation can fix it.
+ const observed429 = countByModel(all, (r) => r.status === 429);
+ const observedSe = countByModel(all, (r) => r.serverError);
+ const history429 = new Map();
+ for (let i = 1; i <= COUNT; i++) {
+  const e = relayEntry(state, i);
+  if (!e.last429.model) continue;
+  if (now() - e.last429.ts > 900_000) continue;
+  history429.set(e.last429.model, (history429.get(e.last429.model) ?? 0) + 1);
  }
- const quotaCapped = new Set(
-  [...throttledCount.entries()].filter(([, n]) => n >= GLOBAL_QUOTA_GUARD).map(([m]) => m),
- );
- for (const m of quotaCapped) {
-  log(`${m} throttled on ${throttledCount.get(m)}/${COUNT} relays — upstream quota, skipping rotation for it this pass`);
+ const quotaCapped = new Set();
+ // No PROBE_MODELS filter: live signals name the client's real models, and a
+ // model capped on a majority of relays is upstream quota whichever lane
+ // reported it.
+ for (const model of new Set([...observed429.keys(), ...history429.keys()])) {
+  const seen = observed429.get(model) ?? 0;
+  const history = history429.get(model) ?? 0;
+  if (seen < GLOBAL_QUOTA_GUARD && history < GLOBAL_QUOTA_GUARD) continue;
+  quotaCapped.add(model);
+  log(`${model} throttled on ${Math.min(Math.max(seen, history), COUNT)}/${COUNT} relays — upstream quota, skipping rotation for it this pass`);
  }
- const rotatable = PROBE_MODELS.filter((m) => !quotaCapped.has(m));
+ const serverErrCapped = new Set();
+ for (const [model, n] of observedSe) {
+  if (n < SERVER_ERROR_GUARD) continue;
+  serverErrCapped.add(model);
+  log(`${model} server_error on ${n}/${COUNT} relays - upstream incident, skipping rotation`);
+ }
 
- // server_error incident guard: a model failing with server_error on nearly
- // every relay is an upstream incident — no egress rotation can fix it, so
- // skip rotation for it this pass (same spirit as GLOBAL_QUOTA_GUARD).
- const serverErrCount = new Map(); // model -> relays with server_error
- for (const r of results) {
-  if (r.serverError) serverErrCount.set(r.model, (serverErrCount.get(r.model) ?? 0) + 1);
- }
- const serverErrCapped = new Set(
-  [...serverErrCount.entries()].filter(([, n]) => n >= SERVER_ERROR_GUARD).map(([m]) => m),
- );
- for (const m of serverErrCapped) {
-  log(`${m} server_error on ${serverErrCount.get(m)}/${COUNT} relays - upstream incident, skipping rotation`);
+ const ctx = {
+  state,
+  dirty,
+  quotaCapped,
+  serverErrCapped,
+  rotations: [],
+  hotRelays: new Map(),
+  seRelays: new Map(),
+  cappedOnly: [],
+ };
+ for (const [index, results] of [...probed.entries()].sort((a, b) => a[0] - b[0])) {
+  await classifyRelay(index, results, ctx);
  }
 
- const hot = new Map(); // index -> 429ed rotatable models
- const cappedOnly = [];
- const troubled = [];
- const serverErr = new Map(); // index -> server_error results (rotatable only)
- const badIndexes = new Set();
- for (const r of results) {
-  if (r.status === 200 && !r.serverError) continue;
-  badIndexes.add(r.index);
-  if (r.serverError) {
-   if (serverErrCapped.has(r.model)) continue; // counted in the guard line above
-   const evt = r.status === 200
-    ? (/response\.failed/i.test(r.detail) ? "response.failed" : /failed to generate/i.test(r.detail) ? "failed to generate" : "server_error")
-    : null;
-   if (evt) log(`#${r.index} ${r.model} server_error in 200 envelope (SSE ${evt})`);
-   else log(`#${r.index} ${r.model} server_error HTTP ${r.status}`);
-   if (!serverErr.has(r.index)) serverErr.set(r.index, []);
-   serverErr.get(r.index).push(r);
-  } else if (r.status === 429) {
-   if (quotaCapped.has(r.model)) continue; // counted in the guard line above
-   if (!hot.has(r.index)) hot.set(r.index, []);
-   hot.get(r.index).push(r.model);
-  } else troubled.push(r);
- }
- for (const i of badIndexes) {
-  if (!hot.has(i) && !serverErr.has(i) && !troubled.some((r) => r.index === i)) cappedOnly.push(i);
- }
- if (cappedOnly.length) log(`throttled only on quota-capped models (left alone): ${cappedOnly.map((i) => `#${i}`).join(" ")}`);
-
- // Speed rotation: clean but slow on SPEED_MODEL, and only when a fast
- // sibling proves the slowness is egress-side. Whole pool slow = upstream.
- const slow = new Map(); // index -> ms
+ // Speed rotation stays opt-in: only when a fast sibling proves the slowness
+ // is egress-side. Tier-1 only, no verification loop.
  if (SLOW_THRESHOLD_MS > 0 && speedRows.length) {
   const fastest = speedRows[0].ms;
-  if (fastest <= SLOW_THRESHOLD_MS) {
-   for (const r of speedRows) {
-    if (r.ms > SLOW_THRESHOLD_MS && !hot.has(r.index)) slow.set(r.index, r.ms);
-   }
-   if (slow.size) log(`slow (>${SLOW_THRESHOLD_MS}ms, fastest #${speedRows[0].index} ${fastest}ms): ` + [...slow.entries()].map(([i, ms]) => `#${i} ${ms}ms`).join(" "));
-  } else {
+  if (fastest > SLOW_THRESHOLD_MS) {
    log(`whole pool slow on ${SPEED_MODEL} (fastest ${fastest}ms) — upstream, no speed rotation`);
+  } else {
+   const slow = speedRows.filter((r) => r.ms > SLOW_THRESHOLD_MS && !dirty.has(r.index));
+   if (slow.length) {
+    log(`slow (>${SLOW_THRESHOLD_MS}ms, fastest #${speedRows[0].index} ${fastest}ms): ` + slow.map((r) => `#${r.index} ${r.ms}ms`).join(" "));
+    for (const row of slow) {
+     const entry = relayEntry(state, row.index);
+     const at = now();
+     const n = entry.consecutiveFailures + 1;
+     const verdict = gate(entry, at);
+     dirty.add(row.index);
+     if (verdict.allowed) {
+      ctx.rotations.push({ index: row.index, n, tier2: false, model: null, verify: false });
+     } else {
+      patchRelay(state, row.index, {
+       dirty: true,
+       lastProbe: at,
+       pendingVerify: false,
+       probeAfter: Math.max(entry.cooldownUntil, at + EGRESS_SETTLE_S * 1000),
+       consecutiveFailures: n,
+      });
+      log(`#${row.index} held: ${verdict.reason}`);
+     }
+    }
+   }
   }
  }
 
- // Every relay with any non-200 model counts against the clean tally —
- // including relays whose only failure is a quota-capped model, which the
- // rotation path deliberately leaves alone. Reporting them as clean is how a
- // fully throttled pool used to log `clean N/N` and exit 0.
- const badRelays = new Set([
-  ...hot.keys(),
-  ...serverErr.keys(),
-  ...troubled.map((r) => r.index),
-  ...cappedOnly,
- ]);
- const hotDesc = [...hot.entries()].map(([i, ms]) => `#${i}(${ms.join(",")})`).join(" ");
- const serverErrDesc = [...serverErr.entries()].map(([i, rs]) => `#${i}(${rs.map((r) => r.model).join(",")})`).join(" ");
- const cappedDesc = cappedOnly.length ? ` | quota-capped: ${cappedOnly.map((i) => `#${i}`).join(" ")}` : "";
- log(`clean ${COUNT - badRelays.size}/${COUNT} relay(s)` + (hot.size ? ` | throttled: ${hotDesc}` : "") + (serverErr.size ? ` | server_error: ${serverErrDesc}` : "") + cappedDesc);
- for (const r of troubled) log(`#${r.index} ${r.model} unexpected HTTP ${r.status || "unreachable"} — ${r.detail}`);
-
- // 502 means the relay app is up but its upstream path failed — a dead WARP
- // tunnel that `restart: always` will never notice. Give it one t1 attempt.
- // Status 0 (host cannot reach the relay) stays operator-only.
- const badGateway = new Map();
- for (const r of troubled) {
-  if (r.status !== 502) continue;
-  if (!badGateway.has(r.index)) badGateway.set(r.index, []);
-  badGateway.get(r.index).push(r.model);
+ for (const [index, model] of [...signalHot.entries()].sort((a, b) => a[0] - b[0])) {
+  classifySignal(index, model, ctx);
  }
 
- if (hot.size === 0 && slow.size === 0 && serverErr.size === 0 && badGateway.size === 0) {
-  if (cappedOnly.length) log(`pool is not cold: throttled on quota-capped model(s) only — nothing rotatable this pass`);
-  else log("pool is cold");
-  return troubled.length === 0 && cappedOnly.length === 0;
+ if (ctx.cappedOnly.length) {
+  log(`throttled only on quota-capped models (left alone): ${ctx.cappedOnly.sort((a, b) => a - b).map((i) => `#${i}`).join(" ")}`);
  }
 
- // server_error phase runs before the 429 path: cheap same-egress re-probes
- // filter transients with zero restarts; sticky relays get exactly one t1.
- const serverHold = [];
- if (serverErr.size) {
-  await runPool([...serverErr.keys()], ROTATE_CONCURRENCY, async (index) => {
-   const models = serverErr.get(index).map((r) => r.model);
-   const { recovered, restarted } = await handleServerError(index, models);
-   // Max 1 restart per relay per pass: a server_error t1 already spent this
-   // relay's churn budget, so drop it from the 429 path (rechecked next pass).
-   if (restarted) hot.delete(index);
-   if (!recovered) serverHold.push(index);
-  });
- }
+ await runPool(ctx.rotations, ROTATE_CONCURRENCY, (job) => runRotation(job, state, dirty));
 
- let allRecovered = true;
- let troubledLeft = [...troubled];
+ // ── summary ──
+ const hotDesc = [...ctx.hotRelays.entries()]
+  .sort((a, b) => a[0] - b[0])
+  .map(([i, models]) => `#${i}(${models.join(",")})`)
+  .join(" ");
+ const seDesc = [...ctx.seRelays.entries()]
+  .sort((a, b) => a[0] - b[0])
+  .map(([i, models]) => `#${i}(${models.join(",")})`)
+  .join(" ");
+ const cleanCount = COUNT - dirty.size;
+ log(`clean ${cleanCount}/${COUNT} relay(s)`
+  + (hotDesc ? ` | throttled: ${hotDesc}` : "")
+  + (seDesc ? ` | server_error: ${seDesc}` : "")
+  + (ctx.cappedOnly.length ? ` | quota-capped: ${ctx.cappedOnly.map((i) => `#${i}`).join(" ")}` : ""));
+ if (dirty.size === 0) log("pool is cold");
+ else log(`pool is not cold: ${dirty.size} relay(s) held or throttled`);
 
- if (badGateway.size) {
-  await runPool([...badGateway.keys()], ROTATE_CONCURRENCY, async (index) => {
-   const badGatewayModels = badGateway.get(index);
-   const recovered = await rotateTier1Once(index, badGatewayModels);
-   // Only the models this rotation re-probed are proven clean. Dropping the
-   // whole relay index would hide a sibling model's 500/transport failure and
-   // let the pass exit 0 on a still-broken relay.
-   if (recovered) {
-    troubledLeft = troubledLeft.filter((r) => !(r.index === index && badGatewayModels.includes(r.model)));
-   } else {
-    allRecovered = false;
-   }
-  });
- }
-
- await runPool([...hot.keys()], ROTATE_CONCURRENCY, async (index) => {
-  const recovered = await rotateUntilClean(index, rotatable);
-  if (!recovered) allRecovered = false;
- });
- const speedSpec = { model: SPEED_MODEL, threshold: SLOW_THRESHOLD_MS };
- await runPool([...slow.keys()], ROTATE_CONCURRENCY, async (index) => {
-  const recovered = await rotateUntilClean(index, rotatable, speedSpec);
-  if (!recovered) allRecovered = false;
- });
- return allRecovered && troubledLeft.length === 0 && serverHold.length === 0 && cappedOnly.length === 0;
+ // Exit 0 only when every relay is known clean: nothing dirty, nothing
+ // quota-capped, nothing troubled, no rotation awaiting verification.
+ return dirty.size === 0;
 }
 
 // ── Entry point ─────────────────────────────────────────────────────
@@ -854,7 +1251,7 @@ if (LOOP) {
   try {
    await pass();
   } catch (e) {
-   log(`pass failed: ${String(e?.message ?? e).slice(0, 200)}`);
+   log(`pass failed: ${shortReason(e).slice(0, 200)}`);
   }
   // Fixed deadline: a slow pass must not push every later pass.
   await new Promise((r) => setTimeout(r, Math.max(0, started + INTERVAL_S * 1_000 - Date.now())));

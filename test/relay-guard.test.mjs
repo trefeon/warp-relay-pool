@@ -15,6 +15,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const CONNECTS = [];
@@ -38,6 +40,10 @@ let secondUpstream;
 let relay2;
 let upstreamHits = 0;
 let secondHits = 0;
+// Live signal state files live outside the repo so a test run never dirties
+// the tree (and .keep-cold/ is git-ignored anyway).
+let signalDir;
+let signalFile;
 
 function startForwarder() {
   return new Promise((resolve) => {
@@ -235,6 +241,8 @@ before(async () => {
     res.end("second-upstream");
   });
   forwarder = await startForwarder();
+  signalDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-signals-"));
+  signalFile = path.join(signalDir, "signals.json");
   relay2 = spawn(process.execPath, ["server.mjs"], {
     cwd: REPO_ROOT,
     env: {
@@ -244,6 +252,8 @@ before(async () => {
       WARP_HOST_1: "127.0.0.1",
       WARP_PORT_1: String(forwarder.address().port),
       RELAY_ALLOWED_TARGETS: `http://127.0.0.1:${upstream.address().port}`,
+      LIVE_SIGNALS: "1",
+      LIVE_SIGNAL_FILE: signalFile,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -269,6 +279,11 @@ after(() => {
   forwarder?.close();
   upstream?.close();
   secondUpstream?.close();
+  try {
+    fs.rmSync(signalDir, { recursive: true, force: true });
+  } catch {
+    // Windows may still hold the file briefly after the child exits.
+  }
 });
 
 test("rooted path dispatches through the sink to the allowlisted host", async () => {
@@ -390,4 +405,60 @@ test("retry-after is forwarded to the client", async () => {
   const res = await hitSecond("/ratelimit");
   assert.equal(res.status, 429);
   assert.equal(res.headers.get("retry-after"), "7");
+});
+
+// ── Live 429 signals ────────────────────────────────────────────────
+function readSignals() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(signalFile, "utf8"));
+    return Array.isArray(parsed?.signals) ? parsed.signals : [];
+  } catch {
+    return [];
+  }
+}
+
+// The writer coalesces on a timer, so a record appears up to flushMs later.
+async function waitForSignals(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const signals = readSignals();
+    if (predicate(signals) || Date.now() >= deadline) return signals;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+test("a live 429 is signalled once per relay/model and cleared by recovery", async () => {
+  const model = "test/model-a";
+  const mine = (signals) => signals.filter((s) => s.model === model);
+
+  const first = await hitSecond("/ratelimit", { method: "POST", body: JSON.stringify({ model }) });
+  assert.equal(first.status, 429);
+  await first.text();
+
+  let signals = await waitForSignals((all) => mine(all).length === 1);
+  assert.deepEqual(
+    mine(signals).map(({ relay, model: m, status, retryAfter }) => ({ relay, model: m, status, retryAfter })),
+    [{ relay: 1, model, status: 429, retryAfter: 7 }],
+  );
+  assert.equal(typeof mine(signals)[0].ts, "number");
+
+  // A repeat 429 for the same key is not a state change: nothing is written
+  // (the wait comfortably exceeds the writer's flush timer).
+  const repeat = await hitSecond("/ratelimit", { method: "POST", body: JSON.stringify({ model }) });
+  assert.equal(repeat.status, 429);
+  await repeat.text();
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(mine(readSignals()).length, 1);
+
+  // A success for the same model is the recovery record.
+  const ok = await hitSecond("/v1/models", { method: "POST", body: JSON.stringify({ model }) });
+  assert.equal(ok.status, 200);
+  await ok.text();
+
+  signals = await waitForSignals((all) => mine(all).length === 2);
+  const records = mine(signals);
+  assert.equal(records.length, 2);
+  assert.equal(records[1].status, 200);
+  assert.equal(records[1].retryAfter, null);
+  assert.equal(records[1].relay, 1);
 });

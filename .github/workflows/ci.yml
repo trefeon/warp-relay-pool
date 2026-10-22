@@ -60,6 +60,12 @@ jobs:
       - name: warp-lite image builds
         run: docker build -t warp-lite:ci ./warp-lite
 
+      # The relay image is COPY-baked: a module the server imports but the
+      # Dockerfile does not copy crash-loops the container at deploy time, and
+      # `node --check` cannot see that.
+      - name: relay image builds
+        run: docker build -t warp-relay:ci .
+
       - name: Install relay deps (lockfile)
         run: npm ci --no-audit --no-fund
 
