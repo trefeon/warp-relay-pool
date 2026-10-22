@@ -22,7 +22,7 @@ relay app are never touched, so every `<RELAY-N-URL>` survives rotation.
   upstream noise. Re-enable only on median-over-N evidence.
 - **Two-Tier Rotation:**
   - **Tier 1 (Default):** Restarts only the container (`docker restart warp-relay-warp-N`). Keeps the existing WireGuard keys in `/etc/wireguard` but acquires a fresh `/64` egress IP path from Cloudflare without spending an account registration.
-  - **Tier 2 (Fallback):** If a relay remains throttled after Tier 1, clears `/etc/wireguard/wg0.conf` and restarts to force a brand new account registration.
+  - **Tier 2 (Fallback):** If a relay remains throttled after Tier 1, clears `/etc/wireguard/wg0.conf` and restarts to force a brand new account registration. It is spent only after **two** failed post-restart verifications (not on the first re-rotation), at most once per relay per `TIER2_MIN_INTERVAL_S`, because a re-key is one Cloudflare registration and a throttled registration crash-loops the container.
 - **Upstream `server_error` Detection:** Scans the first 2 SSE chunks on HTTP 200 responses to catch upstream provider crashes ("The model failed to generate a response"), preventing futile rotation loops during upstream outages.
 - Concurrency: `ROTATE_CONCURRENCY` (default `1`) bounds restarts, and they
   are additionally serialised at least `ROTATE_SPACING_MS` apart regardless of

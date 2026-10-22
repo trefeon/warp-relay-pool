@@ -42,10 +42,11 @@
  *
  * A 429 carrying a numeric `retry-after` <= 120 s never restarts: it sets the
  * next probe time instead. Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
- * one Cloudflare registration) is used only for pure 429 batches, at most once
- * per relay per TIER2_MIN_INTERVAL_S; server_error and 502 rotations are
- * tier-1 only. Nodes without wg0.conf abort the re-key and fall back to a
- * plain restart, leaving their registration untouched.
+ * one Cloudflare registration) is used only for pure 429 batches, after two
+ * failed post-restart verifications, and at most once per relay per
+ * TIER2_MIN_INTERVAL_S; server_error and 502 rotations are tier-1 only. Nodes
+ * without wg0.conf abort the re-key and fall back to a plain restart, leaving
+ * their registration untouched.
  *
  * Guardrails
  * ----------
@@ -1016,7 +1017,10 @@ async function classifyRelay(index, results, ctx) {
   ctx.rotations.push({
    index,
    n,
-   tier2: entry.lastRotate > 0 && pure429 && tier2Allowed(index),
+   // Tier-2 spends a Cloudflare registration and a re-key is what crash-loops a
+  // container when CF throttles registration. Escalate only after two failed
+  // post-restart verifications: the first re-rotation gets a cheap tier-1.
+  tier2: entry.consecutiveFailures >= 2 && pure429 && tier2Allowed(index),
    model: hot[0]?.model ?? seLeft[0]?.model ?? gateway[0]?.model ?? null,
   });
   return;
@@ -1062,7 +1066,7 @@ function classifySignal(index, model, ctx) {
   ctx.rotations.push({
    index,
    n,
-   tier2: entry.lastRotate > 0 && tier2Allowed(index),
+   tier2: entry.consecutiveFailures >= 2 && tier2Allowed(index),
    model: model || null,
   });
   return;

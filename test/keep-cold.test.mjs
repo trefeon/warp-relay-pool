@@ -22,10 +22,10 @@ const REPO_ROOT = path.resolve(import.meta.dirname, "..");
 // reuses one.
 const PORT_MIN = 25000;
 const PORT_MAX = 25999;
-const PORT_BLOCK = 64;
+const PORT_BLOCK = 32;
 // Behaviour scenarios that bind relays: keep this in step with the tests below
 // so the random start always leaves room for every block.
-const SCENARIO_BLOCKS = 15;
+const SCENARIO_BLOCKS = 16;
 let nextBlock = PORT_MIN
  + Math.floor(Math.random() * (PORT_MAX - PORT_MIN + 1 - PORT_BLOCK * SCENARIO_BLOCKS));
 
@@ -316,6 +316,34 @@ test("persistent throttle restarts at most twice in hour 1 and once in hour 2", 
  assert.ok(hour1.length <= 2, `hour 1 restarts: ${hour1.join(",")}`);
  assert.ok(hour2.length <= 1, `hour 2 restarts: ${hour2.join(",")}`);
  assert.ok(restartPasses.length >= 2, `only ${restartPasses.length} restart(s) — the throttle was never rotated`);
+});
+
+// ── case 4b: tier 2 waits for two failed verifications ──────────────
+test("a re-rotation escalates to tier 2 only after two failed verifications", async () => {
+ const sc = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429 } } } });
+ await startRelays(sc);
+ const rotatedAt = Date.now() - 700_000;
+ writeStateFile(sc, {
+  1: entry({
+   lastRotate: rotatedAt,
+   consecutiveFailures: 1,
+   dirty: true,
+   pendingVerify: true,
+   last429: { model: "model-a", ts: rotatedAt },
+   rotations: [rotatedAt],
+  }),
+ });
+ const env = { EGRESS_SETTLE_S: "0", PROBE_AUDIT_SAMPLE: "0", RELAY_MAX_ROTATIONS_PER_HOUR: "4" };
+ const first = await runOnce(sc, env);
+ assert.equal(first.code, 1, first.stdout + first.stderr);
+ // One prior failure: the second rotation is still the cheap tier-1 (a plain
+ // restart, no Cloudflare registration).
+ assert.match(fs.readFileSync(sc.dockerLog, "utf8"), /^restart warp-relay-warp-1$/m);
+ assert.doesNotMatch(fs.readFileSync(sc.dockerLog, "utf8"), /rm -f \/etc\/wireguard\/wg0\.conf/);
+
+ const second = await runOnce(sc, { ...env, KEEP_COLD_CLOCK_SKEW_S: "700" });
+ assert.equal(second.code, 1, second.stdout + second.stderr);
+ assert.match(fs.readFileSync(sc.dockerLog, "utf8"), /rm -f \/etc\/wireguard\/wg0\.conf/);
 });
 
 // ── case 5: quota guard wins ───────────────────────────────────────
