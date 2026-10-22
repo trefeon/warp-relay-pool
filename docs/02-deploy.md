@@ -100,14 +100,16 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now warp-keep-cold.timer
 ```
 
-The service is `Type=oneshot` with `TimeoutStartSec=3600` (at the default
-serial rotation, a stuck relay can spend ~6 minutes per attempt) and
-`flock -n -E 0` so an overlapping timer fire is contention, not failure.
-The timer fires every 5 minutes (`OnCalendar`). Without `--loop`, one pass
-= one timer fire.
+The service is `Type=oneshot` with `TimeoutStartSec` sized for the first
+baseline sweep (most relays may need one restart); later passes are short
+because probing is demand-driven and a relay is restarted at most once per
+`RELAY_COOLDOWN_S`. `flock -n -E 0` makes an overlapping timer fire
+contention, not failure. The timer fires every 5 minutes (`OnCalendar`).
+Without `--loop`, one pass = one timer fire.
 
 Exit status: `0` = every relay clean; `1` = a relay is still hot, a
-server_error held, a 502 did not recover, or a model is throttled on
+server_error held, a 502 did not recover, a relay was just rotated and is
+still awaiting post-restart verification, or a model is throttled on
 `GLOBAL_QUOTA_GUARD` relays (upstream quota — logged as
 `quota-capped`, deliberately not rotated). See
 [04](04-operations-keep-cold.md) for tuning.
