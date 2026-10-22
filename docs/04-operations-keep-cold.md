@@ -34,6 +34,17 @@ INTERVAL_S=600 node keep-cold.mjs --loop   # pass every 10 min, foreground
 node keep-cold.mjs --help            # usage (unknown flags exit 2)
 ```
 
+## Exit status
+
+- `0` — every relay answered 200 for every probed model.
+- `1` — pool is not cold: a relay is throttled, quota-capped,
+  `server_error`, unreachable, or returned a bad gateway. Quota-capped
+  relays are deliberately **not** counted clean: when the upstream free
+  tier throttles a model on `GLOBAL_QUOTA_GUARD` relays, rotation cannot
+  help and the pass skips it, but the unit still reports failure so a
+  fully throttled pool never looks green.
+- `2` — usage or configuration error.
+
 ## Tunables
 
 | Env | Default | Meaning |
