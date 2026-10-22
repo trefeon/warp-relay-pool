@@ -385,6 +385,10 @@ function probeHeaders(relayPath) {
   // on purpose so a rotation never depends on tunnel state.
   "x-relay-target": PROBE_TARGET,
   "x-relay-path": relayPath,
+  // Marks keep-cold's own traffic: the relay app's live-signal writer must not
+  // turn a probe's 429 into a "live traffic" signal (it would feed the next
+  // pass a throttle the probe itself just created). Stripped before upstream.
+  "x-keep-cold-probe": "1",
   accept: "text/event-stream",
  };
 }
@@ -1100,6 +1104,11 @@ async function pass() {
   if (signals) {
    for (const sig of signals) {
     const index = sig.relay;
+    const entry = relayEntry(state, index);
+    // A record older than the relay's own last restart describes an egress
+    // that no longer exists: rotating on it would restart a relay that was
+    // already rotated (and possibly re-verified clean) after that 429.
+    if (!Number.isFinite(Number(sig.ts)) || Number(sig.ts) <= entry.lastRotate) continue;
     if (Number(sig.status) === 429) {
      const model = typeof sig.model === "string" ? sig.model : "";
      if (!signalHot.has(index)) signalHot.set(index, model);

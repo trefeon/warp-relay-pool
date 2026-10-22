@@ -388,7 +388,7 @@ test("a live 429 signal rotates the named relay without probing it", async () =>
  await startRelays(sc);
  seedCleanState(sc, 1);
  fs.writeFileSync(sc.signalFile, JSON.stringify({
-  signals: [{ ts: Math.floor(Date.now() / 1000), relay: 12, model: "model-a", status: 429, retryAfter: 30 }],
+  signals: [{ ts: Date.now(), relay: 12, model: "model-a", status: 429, retryAfter: 30 }],
  }));
  const r = await runOnce(sc, { LIVE_SIGNALS: "1", PROBE_AUDIT_SAMPLE: "2" });
  assert.equal(r.code, 1, r.stdout + r.stderr);
@@ -405,7 +405,7 @@ test("a live recovery signal marks the relay clean without probing it", async ()
  writeStateFile(sc, {
   4: entry({ dirty: true, pendingVerify: true, lastRotate: Date.now() - 3600_000, consecutiveFailures: 3, last429: { model: "model-a", ts: Date.now() - 60_000 } }),
  }, 0);
- fs.writeFileSync(sc.signalFile, JSON.stringify({ signals: [{ ts: Math.floor(Date.now() / 1000), relay: 4, model: "model-a", status: 200 }] }));
+ fs.writeFileSync(sc.signalFile, JSON.stringify({ signals: [{ ts: Date.now(), relay: 4, model: "model-a", status: 200 }] }));
  const r = await runOnce(sc, { LIVE_SIGNALS: "1", PROBE_AUDIT_SAMPLE: "2" });
  assert.equal(r.code, 0, r.stdout + r.stderr);
  assert.deepEqual(restartLines(sc), []);
@@ -423,7 +423,7 @@ test("live signals for a quota-capped model restart nothing", async () => {
  // rotating each of them would be the exact churn this scheduler removes.
  const signals = [];
  for (let i = 1; i <= 9; i++) {
-  signals.push({ ts: Math.floor(Date.now() / 1000), relay: i, model: "model-a", status: 429, retryAfter: null });
+  signals.push({ ts: Date.now(), relay: i, model: "model-a", status: 429, retryAfter: null });
  }
  fs.writeFileSync(sc.signalFile, JSON.stringify({ signals }));
  const r = await runOnce(sc, { LIVE_SIGNALS: "1", GLOBAL_QUOTA_GUARD: "9" });
@@ -431,6 +431,23 @@ test("live signals for a quota-capped model restart nothing", async () => {
  assert.deepEqual(restartLines(sc), []);
  assert.match(r.stdout, /model-a throttled on 9\/20 relays — upstream quota/);
  assert.match(r.stdout, /quota-capped: #1 #2 #3 #4 #5 #6 #7 #8 #9/);
+});
+
+// ── case 8c: a stale signal never re-rotates a restarted relay ──────
+test("a signal older than the relay's last rotation is ignored", async () => {
+ const sc = newScenario({ count: 4 });
+ await startRelays(sc);
+ const rotatedAt = Date.now() - 120_000;
+ writeStateFile(sc, {
+  2: entry({ lastRotate: rotatedAt, lastClean: Date.now() - 60_000 }),
+ }, 0);
+ fs.writeFileSync(sc.signalFile, JSON.stringify({
+  signals: [{ ts: rotatedAt - 30_000, relay: 2, model: "model-a", status: 429, retryAfter: null }],
+ }));
+ const r = await runOnce(sc, { LIVE_SIGNALS: "1", PROBE_AUDIT_SAMPLE: "0" });
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ assert.deepEqual(restartLines(sc), []);
+ assert.equal(requests(sc, 2), 0, "a stale signal must not probe the relay either");
 });
 
 // ── case 9: state file robustness ──────────────────────────────────

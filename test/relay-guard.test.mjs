@@ -462,3 +462,38 @@ test("a live 429 is signalled once per relay/model and cleared by recovery", asy
   assert.equal(records[1].retryAfter, null);
   assert.equal(records[1].relay, 1);
 });
+
+test("keep-cold probe traffic is never signalled and its marker is stripped", async () => {
+  // A probe's own 429 must not be replayed to the next pass as a "live" 429:
+  // keep-cold marks its requests, the writer ignores them, and the marker never
+  // reaches the upstream.
+  const model = "test/probe-model";
+  const upstreamUrl = `http://127.0.0.1:${upstream.address().port}`;
+
+  const throttled = await rawRequest({
+    headers: {
+      "x-relay-target": upstreamUrl,
+      "x-relay-path": "/ratelimit",
+      "x-keep-cold-probe": "1",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ model }),
+  });
+  assert.equal(throttled.status, 429);
+
+  const clean = await rawRequest({
+    headers: {
+      "x-relay-target": upstreamUrl,
+      "x-relay-path": "/v1/models",
+      "x-keep-cold-probe": "1",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ model }),
+  });
+  assert.equal(clean.status, 200);
+  assert.equal(JSON.parse(clean.body).headers["x-keep-cold-probe"], undefined);
+
+  // Well past the writer's flush timer: no record may appear for this model.
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.deepEqual(readSignals().filter((s) => s.model === model), []);
+});

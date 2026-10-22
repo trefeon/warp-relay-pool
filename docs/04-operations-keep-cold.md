@@ -84,7 +84,12 @@ change to `LIVE_SIGNAL_FILE` and keep-cold processes it with no probe at all: a
 feeds the quota-guard history), any other status marks that relay clean. The
 file is consumed destructively — after a pass it is atomically rewritten as
 `{"signals":[]}` — so the relay app owns appends and keep-cold owns resets, and
-one writer each keeps the host disk quiet. With `LIVE_SIGNALS=0` keep-cold never
+one writer each keeps the host disk quiet. keep-cold marks its own probe
+requests (`x-keep-cold-probe`): the relay app neither signals them nor forwards
+the marker upstream, so a probe's own 429 can never come back as "live traffic"
+and a stale record can never re-rotate a relay that was already restarted after
+it (records older than the relay's `lastRotate` are ignored). With
+`LIVE_SIGNALS=0` keep-cold never
 touches the file, and the flag is read separately by each process — the
 generator bakes it into the relay container while the host run takes it from its
 own `Environment=`/`--env-file`, so enabling one side alone changes nothing.

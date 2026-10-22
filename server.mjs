@@ -14,6 +14,9 @@ const MAX_INFLIGHT = parseInt(process.env.RELAY_MAX_INFLIGHT || "256", 10);
 const BASE_PORT = parseInt(process.env.BASE_PORT || "3000", 10);
 const HEADER_TARGET = "x-relay-target";
 const HEADER_PATH = "x-relay-path";
+// keep-cold's probes carry this: they must never appear as live-traffic
+// signals, or a probe's own 429 would be replayed to the next pass.
+const HEADER_PROBE = "x-keep-cold-probe";
 const DEFAULT_ALLOWED_TARGETS = "https://opencode.ai,https://api.kilo.ai";
 const ALLOWED_TARGETS = (process.env.RELAY_ALLOWED_TARGETS ?? DEFAULT_ALLOWED_TARGETS)
   .split(",")
@@ -158,6 +161,7 @@ const DROP_HEADERS = new Set([
   "host",
   HEADER_TARGET,
   HEADER_PATH,
+  HEADER_PROBE,
   "connection",
   "keep-alive",
   "proxy-connection",
@@ -291,9 +295,11 @@ function createRelayInstance(index) {
     res.once("close", onClientClose);
     const upstreamTimeout = AbortSignal.timeout(300000);
     // Only bodies can name a model; with signals off the request object is
-    // handed to fetch exactly as before.
+    // handed to fetch exactly as before. Probe traffic is never signalled: the
+    // controller would otherwise chase throttles its own probes reported.
     const hasBody = req.method !== "GET" && req.method !== "HEAD";
-    const sniffer = signalWriter && hasBody ? createModelSniffer() : null;
+    const isProbe = req.headers[HEADER_PROBE] !== undefined;
+    const sniffer = signalWriter && hasBody && !isProbe ? createModelSniffer() : null;
     try {
       const upstream = await fetch(upstreamUrl, {
         method: req.method,
@@ -307,7 +313,7 @@ function createRelayInstance(index) {
         signal: AbortSignal.any([upstreamTimeout, controller.signal]),
       });
 
-      if (signalWriter) {
+      if (signalWriter && !isProbe) {
         // Best-effort and additive: a signal failure must never reach the
         // response path.
         try {
