@@ -38,7 +38,7 @@ Or run non-interactively with auto-detected sizing recommendations:
 ```
 
 ### What the Setup Wizard Does:
-1. **Prerequisite Check & Auto-Install:** Verifies and automatically installs Docker, Docker Compose, and Node.js if missing.
+1. **Prerequisite Check & Auto-Install:** Verifies and automatically installs Docker, Docker Compose, and Node.js 18+ (for the prober) if missing.
 2. **Hardware Sizing:** Detects VPS RAM and CPU cores, recommends safe relay limits, and defaults to the **5-relay sweet spot**.
 3. **MicroWARP Build:** Builds the ultra-lightweight WireGuard + microsocks engine (~1.8 MiB RAM per relay).
 4. **TryCloudflare Tunnel Wiring:** Automatically exposes each relay on a public HTTPS URL without requiring any Cloudflare account, domain name, or open inbound firewall ports.

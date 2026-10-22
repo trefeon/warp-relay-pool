@@ -1,8 +1,8 @@
 # 02 — Deploy
 
 Runs on a Docker Linux host (needs `NET_ADMIN` for WARP; not Windows).
-Prereqs: `docker compose`, `node >= 22` (for `keep-cold.mjs`), and systemd
-for the timers. For mesh-VPN ingress, the host must already be joined to
+Prereqs: `docker compose`, `node >= 18` for `keep-cold.mjs` (the test suite
+and the relay image use Node 22), and systemd for the timers. For mesh-VPN ingress, the host must already be joined to
 your tailnet. `setup.sh` may install Docker and Node itself; if the invoking
 user is not yet in the `docker` group, the wizard re-executes under `sudo`.
 

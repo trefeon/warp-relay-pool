@@ -196,7 +196,7 @@ log_ok "Docker and Docker Compose verified ($DOCKER_COMPOSE)."
 # Auto-install Node.js if missing (for keep-cold rotation prober)
 NODE_BIN="$(command -v node 2>/dev/null || true)"
 if [ -z "$NODE_BIN" ]; then
-  log_warn "Node.js (>=22) is needed for keep-cold auto-rotation prober."
+  log_warn "Node.js (>=18) is needed for the keep-cold auto-rotation prober."
   DO_INSTALL_NODE=true
   if [ "$AUTO_YES" != true ]; then
     printf "Install Node.js on the VPS for rate-limit auto-rotation? [Y/n]: "
@@ -444,6 +444,17 @@ fi
 # -------------------------------------------------------------
 # 4. Build Minimal MicroWARP & Relay Images
 # -------------------------------------------------------------
+# The generated compose intentionally drops SYS_MODULE. Ensure the host loads
+# the WireGuard module at boot so a reboot does not leave wg-quick unable to
+# create its interface.
+if command -v systemctl >/dev/null 2>&1 && { [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; }; then
+  if run_elevated sh -c 'mkdir -p /etc/modules-load.d && { grep -qx wireguard /etc/modules-load.d/wireguard.conf 2>/dev/null || echo wireguard > /etc/modules-load.d/wireguard.conf; }'; then
+    log_info "WireGuard module will load at boot (/etc/modules-load.d/wireguard.conf)."
+  else
+    log_warn "Could not persist the WireGuard module load; verify 'modprobe wireguard' after reboot."
+  fi
+fi
+
 log_info "Building minimal MicroWARP image (warp-lite:latest, ~1.8 MiB RAM/node)..."
 docker build -t warp-lite:latest ./warp-lite
 
@@ -492,11 +503,11 @@ NODE_MAJOR=0
 if [ -n "$NODE_BIN" ]; then
   NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
 fi
-if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -lt 22 ]; then
-  log_warn "Node.js $("$NODE_BIN" -v) is older than 22; the prober needs >=22. Skipping the timers."
+if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -lt 18 ]; then
+  log_warn "Node.js $("$NODE_BIN" -v) is older than 18; the prober needs >=18. Skipping the timers."
 fi
 
-if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 22 ] && command -v systemctl >/dev/null 2>&1; then
+if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/null 2>&1; then
   SETUP_SYSTEMD=true
   if [ "$AUTO_YES" != true ]; then
     echo ""
