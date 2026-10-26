@@ -99,6 +99,18 @@ node keep-cold.mjs --probe
 TARGET_MODEL=mimo-v2.6-flash-free node keep-cold.mjs --probe
 ```
 
+The probe carries the same client shape as production traffic: pinned client
+headers, the six declared tools, and the environment block real coding
+sessions send (working directory). The free tier refuses requests without
+that block with an all-egress 429 that looks exactly like throttling, so a
+probe that omitted it could never tell a hot address from a clean one.
+
+A 429 on some relays is per-address throttling — rotating those relays onto
+fresh addresses clears it. A 429 on every relay at once, surviving a full
+reset with retry-after counting down to 00:00 UTC, is either upstream quota
+(no rotation helps; the run reports it as quota-capped) or the probe shape
+itself being refused (check the prober; rotating the pool cannot fix that).
+
 ## Cost control
 
 An inference probe is itself traffic that can trip the throttle it is looking

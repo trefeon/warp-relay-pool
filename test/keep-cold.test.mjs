@@ -25,7 +25,7 @@ const PORT_MAX = 26999;
 const PORT_BLOCK = 32;
 // Behaviour scenarios that bind relays: keep this in step with the tests below
 // so the random start always leaves room for every block.
-const SCENARIO_BLOCKS = 44;
+const SCENARIO_BLOCKS = 45;
 let nextBlock = PORT_MIN
  + Math.floor(Math.random() * Math.max(1, PORT_MAX - PORT_MIN + 1 - PORT_BLOCK * SCENARIO_BLOCKS));
 
@@ -114,14 +114,20 @@ function startRelay(port, logFile, throttle) {
    req.on("end", () => {
     let model = "";
     let tools = -1;
+    let sys = "";
     try {
       const parsed = JSON.parse(body);
       model = String(parsed.model ?? "");
       tools = Array.isArray(parsed.tools) ? parsed.tools.length : -1;
+      if (Array.isArray(parsed.messages)) {
+        sys = parsed.messages.filter((m) => m && m.role === "system").map((m) => String(m.content ?? "")).join("\n");
+      } else if (typeof parsed.instructions === "string") {
+        sys = parsed.instructions;
+      }
     } catch {
       model = "";
     }
-    fs.appendFileSync(logFile, `${JSON.stringify({ model, ua: req.headers["user-agent"] ?? "", ocClient: req.headers["x-opencode-client"] ?? "", auth: req.headers["authorization"] ?? "", relayTarget: req.headers["x-relay-target"] ?? "", relayPath: req.headers["x-relay-path"] ?? "", keepCold: req.headers["x-keep-cold-probe"] ?? "", session: req.headers["x-opencode-session"] ?? "", tools })}\n`);
+    fs.appendFileSync(logFile, `${JSON.stringify({ model, ua: req.headers["user-agent"] ?? "", ocClient: req.headers["x-opencode-client"] ?? "", auth: req.headers["authorization"] ?? "", relayTarget: req.headers["x-relay-target"] ?? "", relayPath: req.headers["x-relay-path"] ?? "", keepCold: req.headers["x-keep-cold-probe"] ?? "", session: req.headers["x-opencode-session"] ?? "", tools, sys })}\n`);
     const rawSpec = throttle.get(model);
     const spec = typeof rawSpec === "function" ? rawSpec() : rawSpec;
     if (spec) {
@@ -884,7 +890,7 @@ test("PROBE_FINGERPRINT=minimal strips fingerprint headers but keeps relay heade
   const legacy = await runOnce(sc, { TARGET_MODEL: "model-a" }, ["--probe"]);
   assert.equal(legacy.code, 0, legacy.stdout + legacy.stderr);
   const legacyReq = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
-  assert.equal(legacyReq.ua, "opencode/1.18.31");
+  assert.equal(legacyReq.ua, "opencode/1.19.4");
   assert.equal(legacyReq.ocClient, "cli");
   assert.equal(legacyReq.auth, "Bearer public");
   assert.match(legacyReq.session, /^ses_/);
@@ -909,6 +915,35 @@ test("invalid PROBE_FINGERPRINT fails fast instead of probing", async () => {
   const r = await runOnce(sc, { PROBE_FINGERPRINT: "bogus" });
   assert.equal(r.code, 2);
   assert.match(r.stderr, /PROBE_FINGERPRINT/);
+});
+
+test("legacy probe body carries exactly one env pair with Working directory", async () => {
+  const sc = newScenario({ count: 1 });
+  await startRelays(sc);
+  const logPath = path.join(sc.dir, "relay-1.log");
+  const legacy = await runOnce(sc, { TARGET_MODEL: "model-a" }, ["--probe"]);
+  assert.equal(legacy.code, 0, legacy.stdout + legacy.stderr);
+  const req = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  assert.match(req.session, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, "session id keeps the 12-hex+14-alnum gate shape");
+  assert.equal((req.sys.match(/<env>/g) ?? []).length, 1, `exactly one <env> pair: ${req.sys}`);
+  assert.equal((req.sys.match(/Working directory:/g) ?? []).length, 1, `exactly one Working directory pair: ${req.sys}`);
+  fs.writeFileSync(logPath, "");
+  const minimal = await runOnce(sc, { TARGET_MODEL: "model-a", PROBE_FINGERPRINT: "minimal" }, ["--probe"]);
+  assert.equal(minimal.code, 0, minimal.stdout + minimal.stderr);
+  const minReq = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  assert.equal(minReq.sys, "", "minimal mode sends no system block");
+
+  const scR = newScenario({ count: 1 });
+  await startRelays(scR);
+  const rLog = path.join(scR.dir, "relay-1.log");
+  const rProbe = await runOnce(scR, {
+    PROBE_MODELS: "dots-studio/dots-3-note-preview:free",
+    TARGET_MODEL: "dots-studio/dots-3-note-preview:free",
+  }, ["--probe"]);
+  assert.equal(rProbe.code, 0, rProbe.stdout + rProbe.stderr);
+  const rReq = JSON.parse(fs.readFileSync(rLog, "utf8").trim().split("\n").at(-1));
+  assert.equal((rReq.sys.match(/<env>/g) ?? []).length, 1, `responses path carries one <env> pair: ${rReq.sys}`);
+  assert.equal((rReq.sys.match(/Working directory:/g) ?? []).length, 1, `responses path carries Working directory: ${rReq.sys}`);
 });
 
 test("429 scheduling log carries redacted fp descriptor in both modes", async () => {

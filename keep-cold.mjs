@@ -302,6 +302,12 @@ if (!["legacy", "minimal"].includes(PROBE_FINGERPRINT)) {
   console.error(`keep-cold: PROBE_FINGERPRINT='${process.env.PROBE_FINGERPRINT}' must be legacy|minimal`);
   process.exit(2);
 }
+/** Pinned client version for the probe UA: the ecosystem's current pinned
+ * fallback (live npm lookup is a proxy-side concern; the prober stays
+ * deterministic). Declared up here because model discovery runs at module
+ * load, before the fingerprint block below. Minimal mode still sends
+ * keep-cold/1.0. */
+const OPENCODE_PROBE_UA = "opencode/1.19.4";
 
 const POPULAR_MODEL_PATTERNS = [
  /deepseek.*free/i,
@@ -329,7 +335,7 @@ async function discoverOpenCodeFreeModels(targetUrl) {
   const url = `${targetUrl.replace(/\/+$/, "")}/inference/v1/models`;
   const res = await fetch(url, {
    headers: {
-    "user-agent": "opencode/1.18.31",
+    "user-agent": OPENCODE_PROBE_UA,
     "x-opencode-client": "cli",
     "accept": "application/json",
    },
@@ -513,6 +519,18 @@ function fpDescriptor(sid) {
   return `fp=${PROBE_FINGERPRINT}/tools=${toolCount}/auth=${hasAuth}/sid=${String(sid).slice(0, 10)}`;
 }
 
+/** System prompt carrying the environment block the OpenCode free tier gates on:
+ * a request whose system prompt has no `<env>` pair with `Working directory:`
+ * is refused with deterministic 429 FreeUsageLimitError on any egress, so a
+ * probe without it can never distinguish throttled from clean. A missing block
+ * reads exactly like throttling: every relay 429s, including fresh egresses a
+ * rotation just minted — rotation can never clear it. Tell the two apart by
+ * scope: per-egress quota clears on a fresh address and trips only some relays
+ * (the pool-wide guard counts agreement across relays), while a gate refusal
+ * hits every egress at once with retry-after counting down to 00:00 UTC. If a
+ * full reset still 429s everywhere, suspect the probe shape, not the pool. */
+const PROBE_SYSTEM_PROMPT = "You are a coding agent.\n<env>\n  Working directory: /tmp/keep-cold-probe\n</env>";
+
 /** Build the wire-path + body for a probed model (chat vs responses). */
 function buildProbe(model) {
   const minimal = PROBE_FINGERPRINT === "minimal";
@@ -523,7 +541,7 @@ function buildProbe(model) {
         model,
         input: "ping",
         stream: true,
-        ...(minimal ? {} : { tools: RESPONSE_PLACEHOLDER_TOOLS }),
+        ...(minimal ? {} : { instructions: PROBE_SYSTEM_PROMPT, tools: RESPONSE_PLACEHOLDER_TOOLS }),
       }),
     };
   }
@@ -533,7 +551,10 @@ function buildProbe(model) {
       model,
       stream: true,
       max_tokens: 4,
-      messages: [{ role: "user", content: "ping" }],
+      messages: [
+        ...(minimal ? [] : [{ role: "system", content: PROBE_SYSTEM_PROMPT }]),
+        { role: "user", content: "ping" },
+      ],
       ...(minimal ? {} : { tools: PLACEHOLDER_TOOLS }),
     }),
   };
@@ -559,7 +580,7 @@ function probeHeaders(relayPath, sidOverride) {
   }
   const headers = {
     "content-type": "application/json",
-    "user-agent": "opencode/1.18.31",
+    "user-agent": OPENCODE_PROBE_UA,
     "x-opencode-client": OPENCODE_CLIENT,
     "x-opencode-project": OPENCODE_PROJECT,
     "x-opencode-session": sid,
