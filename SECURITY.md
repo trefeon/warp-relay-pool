@@ -8,11 +8,24 @@ the security model, the repository privacy rules, and how to report issues.
 ## Security model
 
 **Allowlist gate (`server.mjs`).** Every relayed request must carry an
-`x-relay-target` header that exactly matches an entry of
+`x-relay-target` header that matches an entry of
 `RELAY_ALLOWED_TARGETS` (default: `https://opencode.ai`,
-`https://api.kilo.ai`). Anything else gets `403 Forbidden`. The upstream
-request is always `<allowlisted-target>` + `x-relay-path`, so the relay can
-only ever reach allowlisted hosts — it is not a general-purpose open proxy.
+`https://api.kilo.ai`, `https://oai.endpoints.kepler.ai.cloud.ovh.net`).
+Exact-origin entries match that origin only; `*` matches any `http`/`https`
+origin, `*.suffix` matches the apex plus subdomains, and `re:<regex>` is an
+anchored JS regex on the origin. Anything else gets `403 Forbidden`. The upstream
+request is always `<allowlisted-target>` + `x-relay-path`, so a closed
+allowlist (exact origins only) can only ever reach allowlisted hosts — it
+is not a general-purpose open proxy.
+
+**Universal mode boundary.** A wildcard (`*`, `*.suffix`) or `re:` entry
+widens the relay to arbitrary origins, so `RELAY_AUTH_TOKEN` is mandatory
+there: requests matching only via wildcard/regex must carry
+`x-relay-auth: <token>` (else `401`; exact-origin matches never need it,
+health check exempt). A wildcard entry with no token configured is an open
+proxy for anyone who can reach the listener. Pass the token via host env at
+generation time, never commit it, and keep relay ports on loopback or the
+Tailscale IP. Details: `docs/06-universal-proxy.md`.
 
 **No client authentication.** The relay trusts anyone who can reach a
 listener. Possession of a relay URL is enough to (a) make allowlisted

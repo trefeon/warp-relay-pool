@@ -52,5 +52,10 @@ whenever `package.json` changes — CI uses `npm ci`.
 
 - Runtime protocol and topology are frozen (see `README.md`); proposals
   that change them belong in an issue first.
+- Lane scope: the universal proxy lane (`*` / `*.suffix` / `re:` entries,
+  `RELAY_AUTH_TOKEN`, `CONNECT` / absolute-form handling in `server.mjs`,
+  `docs/06-universal-proxy.md`) is additive — it must not change closed-mode
+  behavior. The pi-freeflow / keep-cold probe lane is frozen: do not alter
+  probe targets, fingerprint headers, or rotation behavior for universal use.
 - Scripts must stay `sh`-portable; the repo runs on a Docker Linux host.
 - No secrets in the tree: `.env*` (except `.env.example`) is ignored.

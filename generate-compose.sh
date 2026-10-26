@@ -117,8 +117,9 @@ cat <<HEADER
 # Topology: bridge 10.244.0.0/16, relay app fixed at 10.244.0.100.
 # warp-N raw SOCKS5 proxy on ${SOCKS_BIND}:<10800+N> (override bind: WARP_BIND),
 # ${ROUTER_LINE}.
-# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS, LIVE_SIGNALS,
-# LIVE_SIGNAL_FILE) is baked from the generation-time environment / .env —
+# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS,
+# RELAY_AUTH_TOKEN, LIVE_SIGNALS, LIVE_SIGNAL_FILE) is baked from the
+# generation-time environment / .env —
 # regenerate after editing either.
 # The relay app bind-mounts ./.keep-cold at /signals so its 429 signal file
 # lands in the same directory the host keep-cold reads (LIVE_SIGNALS=1).
@@ -225,6 +226,7 @@ cat <<ENTRY
       - RELAY_COUNT=${COUNT}
       - BASE_PORT=${BASE_PORT:-3000}
       - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net}
+      - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:-}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
       - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
     volumes:
@@ -249,6 +251,7 @@ cat <<ENTRY
       - RELAY_COUNT=${COUNT}
       - BASE_PORT=${BASE_PORT:-3000}
       - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net}
+      - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:-}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
       - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
     volumes:
