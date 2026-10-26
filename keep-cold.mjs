@@ -121,7 +121,9 @@
  *                       discovered free tag models from OpenCode)
  *   PROBE_MODEL         legacy single-model override (used only when
  *                       PROBE_MODELS is unset)
- *   RESPONSES_MODELS    comma-separated models probed via PROBE_RESPONSES_PATH
+ *   PROBE_FINGERPRINT   probe wire shape: legacy (default, current OpenCode
+ *                       sextet+headers, byte-identical) or minimal (relay-only,
+ *                       no fingerprint headers/tools)
  *   GLOBAL_QUOTA_GUARD  relays-throttled threshold at which a model counts as
  *                       upstream quota (default max(8, COUNT-1), capped at COUNT)
  *   SERVER_ERROR_RETRY  same-egress re-probes before a server_error rotation
@@ -295,6 +297,11 @@ const PROBE_CHAT_PATH = envPath("PROBE_CHAT_PATH", "/inference/v1/chat/completio
 const PROBE_RESPONSES_PATH = envPath("PROBE_RESPONSES_PATH", "/inference/v1/responses");
 
 const PROBE_MODELS_MODE = (process.env.PROBE_MODELS_MODE ?? "popular").trim().toLowerCase();
+const PROBE_FINGERPRINT = (process.env.PROBE_FINGERPRINT ?? "legacy").trim().toLowerCase();
+if (!["legacy", "minimal"].includes(PROBE_FINGERPRINT)) {
+  console.error(`keep-cold: PROBE_FINGERPRINT='${process.env.PROBE_FINGERPRINT}' must be legacy|minimal`);
+  process.exit(2);
+}
 
 const POPULAR_MODEL_PATTERNS = [
  /deepseek.*free/i,
@@ -499,59 +506,82 @@ const RESPONSE_PLACEHOLDER_TOOLS = FINGERPRINT_TOOLS.map((name) => ({
  parameters: { type: "object", properties: {} },
 }));
 
-/** Build the wire-path + body for a probed model (chat vs responses). */
-function buildProbe(model) {
- if (RESPONSES_MODELS.has(model)) {
-  return {
-   relayPath: PROBE_RESPONSES_PATH,
-   body: JSON.stringify({
-    model,
-    input: "ping",
-    stream: true,
-    tools: RESPONSE_PLACEHOLDER_TOOLS,
-   }),
-  };
- }
- return {
-  relayPath: PROBE_CHAT_PATH,
-  body: JSON.stringify({
-   model,
-   stream: true,
-   max_tokens: 4,
-   messages: [{ role: "user", content: "ping" }],
-   tools: PLACEHOLDER_TOOLS,
-  }),
- };
+/** Redacted fingerprint descriptor for 429 logs: mode + tool count + auth + sid prefix. Never logs the full session id or Bearer value. */
+function fpDescriptor(sid) {
+  const toolCount = PROBE_FINGERPRINT === "legacy" ? FINGERPRINT_TOOLS.length : 0;
+  const hasAuth = PROBE_FINGERPRINT === "legacy" && PROBE_TARGET.includes("opencode.ai") ? 1 : 0;
+  return `fp=${PROBE_FINGERPRINT}/tools=${toolCount}/auth=${hasAuth}/sid=${String(sid).slice(0, 10)}`;
 }
 
-function probeHeaders(relayPath) {
- const isOpenCode = PROBE_TARGET.includes("opencode.ai");
- const sid = sessionId();
- const headers = {
-  "content-type": "application/json",
-  "user-agent": "opencode/1.18.31",
-  "x-opencode-client": OPENCODE_CLIENT,
-  "x-opencode-project": OPENCODE_PROJECT,
-  "x-opencode-session": sid,
-  // Route through the in-container relay app; the public tunnel is bypassed
-  // on purpose so a rotation never depends on tunnel state.
-  "x-relay-target": PROBE_TARGET,
-  "x-relay-path": relayPath,
-  // Marks keep-cold's own traffic: the relay app's live-signal writer must not
-  // turn a probe's 429 into a "live traffic" signal (it would feed the next
-  // pass a throttle the probe itself just created). Stripped before upstream.
-  "x-keep-cold-probe": "1",
-  accept: "text/event-stream",
- };
- if (isOpenCode) {
-  headers["authorization"] = "Bearer public";
-  headers["x-opencode-session-id"] = sid;
-  headers["x-session-affinity"] = sid;
-  headers["x-session-id"] = sid;
- } else {
-  headers["x-opencode-request"] = `msg_${randomBytes(6).toString("hex")}${randomBytes(14).toString("base64url").slice(0, 14)}`;
- }
- return headers;
+/** Build the wire-path + body for a probed model (chat vs responses). */
+function buildProbe(model) {
+  const minimal = PROBE_FINGERPRINT === "minimal";
+  if (RESPONSES_MODELS.has(model)) {
+    return {
+      relayPath: PROBE_RESPONSES_PATH,
+      body: JSON.stringify({
+        model,
+        input: "ping",
+        stream: true,
+        ...(minimal ? {} : { tools: RESPONSE_PLACEHOLDER_TOOLS }),
+      }),
+    };
+  }
+  return {
+    relayPath: PROBE_CHAT_PATH,
+    body: JSON.stringify({
+      model,
+      stream: true,
+      max_tokens: 4,
+      messages: [{ role: "user", content: "ping" }],
+      ...(minimal ? {} : { tools: PLACEHOLDER_TOOLS }),
+    }),
+  };
+}
+
+function probeHeaders(relayPath, sidOverride) {
+  const isOpenCode = PROBE_TARGET.includes("opencode.ai");
+  const sid = sidOverride ?? sessionId();
+  if (PROBE_FINGERPRINT === "minimal") {
+    return {
+      "content-type": "application/json",
+      "user-agent": "keep-cold/1.0",
+      // Route through the in-container relay app; the public tunnel is bypassed
+      // on purpose so a rotation never depends on tunnel state.
+      "x-relay-target": PROBE_TARGET,
+      "x-relay-path": relayPath,
+      // Marks keep-cold's own traffic: the relay app's live-signal writer must not
+      // turn a probe's 429 into a "live traffic" signal (it would feed the next
+      // pass a throttle the probe itself just created). Stripped before upstream.
+      "x-keep-cold-probe": "1",
+      accept: "text/event-stream",
+    };
+  }
+  const headers = {
+    "content-type": "application/json",
+    "user-agent": "opencode/1.18.31",
+    "x-opencode-client": OPENCODE_CLIENT,
+    "x-opencode-project": OPENCODE_PROJECT,
+    "x-opencode-session": sid,
+    // Route through the in-container relay app; the public tunnel is bypassed
+    // on purpose so a rotation never depends on tunnel state.
+    "x-relay-target": PROBE_TARGET,
+    "x-relay-path": relayPath,
+    // Marks keep-cold's own traffic: the relay app's live-signal writer must not
+    // turn a probe's 429 into a "live traffic" signal (it would feed the next
+    // pass a throttle the probe itself just created). Stripped before upstream.
+    "x-keep-cold-probe": "1",
+    accept: "text/event-stream",
+  };
+  if (isOpenCode) {
+    headers["authorization"] = "Bearer public";
+    headers["x-opencode-session-id"] = sid;
+    headers["x-session-affinity"] = sid;
+    headers["x-session-id"] = sid;
+  } else {
+    headers["x-opencode-request"] = `msg_${randomBytes(6).toString("hex")}${randomBytes(14).toString("base64url").slice(0, 14)}`;
+  }
+  return headers;
 }
 
 // ── Per-relay state ─────────────────────────────────────────────────
@@ -772,41 +802,43 @@ async function readEnvelopeHead(res) {
 
 // ── Probing ─────────────────────────────────────────────────────────
 async function probe(index, model) {
- const url = `http://${RELAY_HOST}:${BASE_PORT + index}`;
- const { relayPath, body } = buildProbe(model);
- const t0 = Date.now();
- try {
-  const res = await fetch(url, {
-   method: "POST",
-   headers: probeHeaders(relayPath),
-   body,
-   signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-  });
-  if (res.status === 200) {
-   // A body that dies mid-read is a wedged egress, not a clean probe: the
-   // old `.catch(() => "")` silently turned it into a 200.
-   let head;
-   try {
-    head = await readEnvelopeHead(res);
-   } catch (e) {
-    return { index, model, status: 0, serverError: false, detail: `body read failed: ${String(e?.message ?? e)}`.slice(0, 160), ms: Date.now() - t0 };
-   }
-   const ms = Date.now() - t0;
-   if (SERVER_ERROR_RE.test(head)) {
-    const evt = /response\.failed/i.test(head) ? "response.failed" : /failed to generate/i.test(head) ? "failed to generate" : "server_error";
-    return { index, model, status: 200, serverError: true, detail: `envelope SSE ${evt}: ${head.replace(/\s+/g, " ").slice(0, 120)}`, ms };
-   }
-   return { index, model, status: 200, serverError: false, detail: "", ms };
+  const url = `http://${RELAY_HOST}:${BASE_PORT + index}`;
+  const { relayPath, body } = buildProbe(model);
+  const sid = sessionId();
+  const fp = fpDescriptor(sid);
+  const t0 = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: probeHeaders(relayPath, sid),
+      body,
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+    if (res.status === 200) {
+      // A body that dies mid-read is a wedged egress, not a clean probe: the
+      // old `.catch(() => "")` silently turned it into a 200.
+      let head;
+      try {
+        head = await readEnvelopeHead(res);
+      } catch (e) {
+        return { index, model, status: 0, serverError: false, detail: `body read failed: ${String(e?.message ?? e)}`.slice(0, 160), ms: Date.now() - t0, fp };
+      }
+      const ms = Date.now() - t0;
+      if (SERVER_ERROR_RE.test(head)) {
+        const evt = /response\.failed/i.test(head) ? "response.failed" : /failed to generate/i.test(head) ? "failed to generate" : "server_error";
+        return { index, model, status: 200, serverError: true, detail: `envelope SSE ${evt}: ${head.replace(/\s+/g, " ").slice(0, 120)}`, ms, fp };
+      }
+      return { index, model, status: 200, serverError: false, detail: "", ms, fp };
+    }
+    const text = await res.text().catch(() => "");
+    const detail = text.replace(/\s+/g, " ").slice(0, 160);
+    // Numeric Retry-After only; an HTTP-date header is left to the gate.
+    const raRaw = res.status === 429 ? res.headers.get("retry-after") : null;
+    const retryAfter = raRaw && /^\d+$/.test(raRaw.trim()) ? Number(raRaw.trim()) : null;
+    return { index, model, status: res.status, serverError: isServerError(res.status, detail), detail, retryAfter, ms: Date.now() - t0, fp };
+  } catch (e) {
+    return { index, model, status: 0, serverError: false, detail: String(e?.message ?? e).slice(0, 160), ms: Date.now() - t0, fp };
   }
-  const text = await res.text().catch(() => "");
-  const detail = text.replace(/\s+/g, " ").slice(0, 160);
-  // Numeric Retry-After only; an HTTP-date header is left to the gate.
-  const raRaw = res.status === 429 ? res.headers.get("retry-after") : null;
-  const retryAfter = raRaw && /^\d+$/.test(raRaw.trim()) ? Number(raRaw.trim()) : null;
-  return { index, model, status: res.status, serverError: isServerError(res.status, detail), detail, retryAfter, ms: Date.now() - t0 };
- } catch (e) {
-  return { index, model, status: 0, serverError: false, detail: String(e?.message ?? e).slice(0, 160), ms: Date.now() - t0 };
- }
 }
 
 /** Probe a set of models on one relay (serial — one relay, one egress). */
@@ -955,7 +987,7 @@ async function freshIpSweep() {
    log(`#${index} probe ${FRESH_IP_MODEL} -> 200 OK (clean)`);
    cleanRelays.push(index);
   } else if (res.status === 429) {
-   log(`#${index} probe ${FRESH_IP_MODEL} -> 429 rate limited` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : ""));
+   log(`#${index} probe ${FRESH_IP_MODEL} -> 429 rate limited` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : "") + ` (${res.fp})`);
    throttledRelays.push(index);
    patchRelay(state, index, { dirty: true, last429: { model: FRESH_IP_MODEL, ts: now() } });
   } else {
@@ -1000,7 +1032,7 @@ async function probePool() {
    clean++;
    log(`#${index} 200 streaming`);
   } else if (res.status === 429) {
-   log(`#${index} 429 rate limited` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : ""));
+   log(`#${index} 429 rate limited` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : "") + ` (${res.fp})`);
   } else {
    log(`#${index} ${res.status || "unreachable"} ${res.detail}`.slice(0, 200));
   }
@@ -1124,7 +1156,7 @@ async function resetRelayUntilClean(index, models, state) {
    log(
     `#${index} [attempt ${attempt}] still 429 on the new egress` +
      (failing[0].retryAfter ? ` (retry-after: ${failing[0].retryAfter}s)` : "") +
-     ` — rotating again for a clean address`,
+     ` — rotating again for a clean address (${failing[0].fp})`,
    );
    streak += 1;
    continue;
@@ -1352,8 +1384,8 @@ async function resetUntilClean() {
    } else if (res.status === 429) {
     rememberThrottledPrefix(pfx, res.retryAfter || 3600);
     log(
-      (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : "") +
-      ` — rotating again for a clean address`,
+      `#${index}` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : "") +
+      ` — rotating again for a clean address (${res.fp})`,
     );
     nextPending.push(index);
     softStreak.set(index, tier === 1 ? streak + 1 : 0);
@@ -1692,7 +1724,7 @@ async function classifyRelay(index, results, ctx) {
    consecutiveFailures: n,
    pendingVerify: false,
   });
-  log(`#${index} retry-after ${waitS}s — scheduling, no restart`);
+  log(`#${index} retry-after ${waitS}s — scheduling, no restart (${retryAfter[0].fp})`);
   return;
  }
 
@@ -1856,7 +1888,7 @@ async function pass() {
   const history = history429.get(model) ?? 0;
   if (seen < GLOBAL_QUOTA_GUARD && history < GLOBAL_QUOTA_GUARD) continue;
   quotaCapped.add(model);
-  log(`${model} throttled on ${Math.min(Math.max(seen, history), COUNT)}/${COUNT} relays — upstream quota, skipping rotation for it this pass`);
+  log(`${model} throttled on ${Math.min(Math.max(seen, history), COUNT)}/${COUNT} relays — upstream quota, skipping rotation for it this pass (fp=${PROBE_FINGERPRINT})`);
  }
  const serverErrCapped = new Set();
  for (const [model, n] of observedSe) {
