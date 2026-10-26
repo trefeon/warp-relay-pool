@@ -113,12 +113,15 @@ function startRelay(port, logFile, throttle) {
    req.on("data", (d) => (body += d));
    req.on("end", () => {
     let model = "";
+    let tools = -1;
     try {
-     model = String(JSON.parse(body).model ?? "");
+      const parsed = JSON.parse(body);
+      model = String(parsed.model ?? "");
+      tools = Array.isArray(parsed.tools) ? parsed.tools.length : -1;
     } catch {
-     model = "";
+      model = "";
     }
-    fs.appendFileSync(logFile, `${JSON.stringify({ model })}\n`);
+    fs.appendFileSync(logFile, `${JSON.stringify({ model, ua: req.headers["user-agent"] ?? "", ocClient: req.headers["x-opencode-client"] ?? "", auth: req.headers["authorization"] ?? "", relayTarget: req.headers["x-relay-target"] ?? "", relayPath: req.headers["x-relay-path"] ?? "", keepCold: req.headers["x-keep-cold-probe"] ?? "", session: req.headers["x-opencode-session"] ?? "", tools })}\n`);
     const rawSpec = throttle.get(model);
     const spec = typeof rawSpec === "function" ? rawSpec() : rawSpec;
     if (spec) {
@@ -872,6 +875,58 @@ test("--probe reports per-relay status without touching any container", async ()
  assert.match(r.stdout, /#2 429 rate limited \(retry-after: 7200s\)/);
  assert.match(r.stdout, /probe summary: 2\/3 streaming 200/);
  assert.equal(fs.existsSync(sc.stateFile), false, "probe mode writes no state");
+});
+
+test("PROBE_FINGERPRINT=minimal strips fingerprint headers but keeps relay headers", async () => {
+  const sc = newScenario({ count: 1 });
+  await startRelays(sc);
+  const logPath = path.join(sc.dir, "relay-1.log");
+  const legacy = await runOnce(sc, { TARGET_MODEL: "model-a" }, ["--probe"]);
+  assert.equal(legacy.code, 0, legacy.stdout + legacy.stderr);
+  const legacyReq = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  assert.equal(legacyReq.ua, "opencode/1.18.31");
+  assert.equal(legacyReq.ocClient, "cli");
+  assert.equal(legacyReq.auth, "Bearer public");
+  assert.match(legacyReq.session, /^ses_/);
+  assert.equal(legacyReq.tools, 6);
+  assert.equal(legacyReq.relayTarget, "https://opencode.ai");
+  assert.equal(legacyReq.keepCold, "1");
+  fs.writeFileSync(logPath, "");
+  const minimal = await runOnce(sc, { TARGET_MODEL: "model-a", PROBE_FINGERPRINT: "minimal" }, ["--probe"]);
+  assert.equal(minimal.code, 0, minimal.stdout + minimal.stderr);
+  const minimalReq = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  assert.equal(minimalReq.ua, "keep-cold/1.0");
+  assert.equal(minimalReq.ocClient, "");
+  assert.equal(minimalReq.auth, "");
+  assert.equal(minimalReq.session, "");
+  assert.equal(minimalReq.tools, -1);
+  assert.equal(minimalReq.relayTarget, "https://opencode.ai");
+  assert.equal(minimalReq.keepCold, "1");
+});
+
+test("invalid PROBE_FINGERPRINT fails fast instead of probing", async () => {
+  const sc = newScenario({ count: 1 });
+  const r = await runOnce(sc, { PROBE_FINGERPRINT: "bogus" });
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /PROBE_FINGERPRINT/);
+});
+
+test("429 scheduling log carries redacted fp descriptor in both modes", async () => {
+  const throttle = { 1: { "model-a": { status: 429, retryAfter: 30 } } };
+  const scLegacy = newScenario({ count: 2, throttle });
+  await startRelays(scLegacy);
+  const rLegacy = await runOnce(scLegacy);
+  assert.equal(rLegacy.code, 1, rLegacy.stdout + rLegacy.stderr);
+  assert.match(rLegacy.stdout, /#1 retry-after 30s — scheduling, no restart \(fp=legacy\/tools=6\/auth=1\/sid=.{10}\)/);
+  assert.doesNotMatch(rLegacy.stdout, /Bearer public/);
+  assert.doesNotMatch(rLegacy.stdout, /ses_[0-9a-f]{12}[0-9A-Za-z]{14}/);
+  const scMinimal = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429, retryAfter: 30 } } } });
+  await startRelays(scMinimal);
+  const rMinimal = await runOnce(scMinimal, { PROBE_FINGERPRINT: "minimal" });
+  assert.equal(rMinimal.code, 1, rMinimal.stdout + rMinimal.stderr);
+  assert.match(rMinimal.stdout, /#1 retry-after 30s — scheduling, no restart \(fp=minimal\/tools=0\/auth=0\/sid=.{10}\)/);
+  assert.doesNotMatch(rMinimal.stdout, /Bearer public/);
+  assert.doesNotMatch(rMinimal.stdout, /ses_[0-9a-f]{12}[0-9A-Za-z]{14}/);
 });
 
 test("auto-discovers popular free models (deepseek, glm, mimo) from OpenCode by default", async () => {
