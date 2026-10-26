@@ -17,11 +17,76 @@ const HEADER_PATH = "x-relay-path";
 // keep-cold's probes carry this: they must never appear as live-traffic
 // signals, or a probe's own 429 would be replayed to the next pass.
 const HEADER_PROBE = "x-keep-cold-probe";
+const HEADER_AUTH = "x-relay-auth";
 const DEFAULT_ALLOWED_TARGETS = "https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net";
 const ALLOWED_TARGETS = (process.env.RELAY_ALLOWED_TARGETS ?? DEFAULT_ALLOWED_TARGETS)
   .split(",")
   .map((s) => s.trim().replace(/\/$/, ""))
   .filter(Boolean);
+// Shared token for wildcard/regex dispatches. Empty/unset disables the gate:
+// every allowlisted target passes without x-relay-auth. When set, targets
+// matched ONLY via wildcard ("*"/"*.suffix") or "re:" entries require
+// `x-relay-auth: <token>` (401 otherwise); exact-origin hits never need it
+// and the health path is exempt.
+const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || "";
+
+// Universal-proxy allowlist matcher. Each entry is one of:
+//   exact origin  ("https://opencode.ai")
+//   "*"           (any http/https origin)
+//   "*.suffix"    (apex + subdomains over http/https)
+//   "re:<regex>"  (JS regex tested against the origin)
+// Returns { matched, exact } — exact hits bypass the token gate even when a
+// wildcard/regex entry would also match.
+function matchTarget(target) {
+  if (!target) return { matched: false, exact: false };
+  let url;
+  try {
+    url = new URL(target);
+  } catch {
+    return { matched: false, exact: false };
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return { matched: false, exact: false };
+  const origin = url.origin;
+  const hostname = url.hostname.toLowerCase();
+  let matched = false;
+  let exact = false;
+  for (const entry of ALLOWED_TARGETS) {
+    if (entry === "*") {
+      matched = true;
+    } else if (entry.startsWith("*.")) {
+      const suffix = entry.slice(2).toLowerCase();
+      if (suffix && (hostname === suffix || hostname.endsWith(`.${suffix}`))) matched = true;
+    } else if (entry.startsWith("re:")) {
+      let re;
+      try {
+        re = new RegExp(entry.slice(3));
+      } catch {
+        continue;
+      }
+      if (re.test(origin)) matched = true;
+    } else {
+      try {
+        if (new URL(entry).origin === origin) {
+          matched = true;
+          exact = true;
+        }
+      } catch {
+        if (entry === target) {
+          matched = true;
+          exact = true;
+        }
+      }
+    }
+  }
+  if (!matched) return { matched: false, exact: false };
+  return { matched, exact };
+}
+
+function isAuthorized(req, match) {
+  if (!RELAY_AUTH_TOKEN) return true;
+  if (match.exact) return true;
+  return req.headers[HEADER_AUTH] === RELAY_AUTH_TOKEN;
+}
 
 // Live rate-limit signals: report the egress/model that just answered 429 so
 // keep-cold can rotate only what is actually throttled. Off by default — the
@@ -162,6 +227,7 @@ const DROP_HEADERS = new Set([
   HEADER_TARGET,
   HEADER_PATH,
   HEADER_PROBE,
+  HEADER_AUTH,
   "connection",
   "keep-alive",
   "proxy-connection",
@@ -227,10 +293,26 @@ function createRelayInstance(index) {
       inflight -= 1;
     });
 
-    const target = req.headers[HEADER_TARGET]?.replace(/\/$/, "");
-    const relayPath = req.headers[HEADER_PATH] || "/";
+    let target = req.headers[HEADER_TARGET]?.replace(/\/$/, "");
+    let relayPath = req.headers[HEADER_PATH] || "/";
+
+    // Standard forward-proxy absolute-form: `GET http://host/path` arrives
+    // with req.url as the absolute URI. When x-relay-target is absent,
+    // derive target+path from it so plain proxy clients work header-free.
+    if (!target && typeof req.url === "string" && /^https?:\/\//i.test(req.url)) {
+      try {
+        const abs = new URL(req.url);
+        if (abs.protocol === "http:" || abs.protocol === "https:") {
+          target = abs.origin;
+          relayPath = (abs.pathname + abs.search) || "/";
+        }
+      } catch {
+        // Fall through to the health check below.
+      }
+    }
 
     // Direct health check: only when NO x-relay-target header is passed
+    // (and the request line is not absolute-form). Exempt from the token gate.
     if (!target) {
       try {
         const trace = await fetch("https://cloudflare.com/cdn-cgi/trace", {
@@ -249,9 +331,14 @@ function createRelayInstance(index) {
       }
     }
 
-    if (!ALLOWED_TARGETS.includes(target)) {
+    const match = matchTarget(target);
+    if (!match.matched) {
       res.writeHead(403, { "content-type": "application/json" });
       return res.end(JSON.stringify({ error: "Forbidden target" }));
+    }
+    if (!isAuthorized(req, match)) {
+      res.writeHead(401, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ error: "Unauthorized" }));
     }
 
     // The allowlist check above only validates the raw header string; the
@@ -378,6 +465,103 @@ function createRelayInstance(index) {
   server.requestTimeout = 0;
   server.timeout = 0;
   server.on("connection", (socket) => socket.setNoDelay(true));
+  // Standard forward-proxy CONNECT: host:port is restricted to 443/80, the
+  // hostname is matched as an https-origin through the same allowlist, and
+  // the token gate applies (exact hits exempt). On success the relay answers
+  // 200 and pipes raw TCP over a SOCKS-connected socket — no interception,
+  // no redirect following. The in-flight guard mirrors the request path.
+  server.on("connect", (req, clientSocket, head) => {
+    req.on("error", () => {});
+    clientSocket.on("error", () => {});
+    const deny = (code, text) => {
+      try {
+        clientSocket.write(`HTTP/1.1 ${code} ${text}\r\nContent-Length: 0\r\n\r\n`);
+      } catch {
+        // Ignored: the client is already gone.
+      }
+      clientSocket.destroy();
+    };
+    if (MAX_INFLIGHT > 0 && inflight >= MAX_INFLIGHT) {
+      deny(503, "Service Unavailable");
+      return;
+    }
+    inflight += 1;
+    clientSocket.once("close", () => {
+      inflight -= 1;
+    });
+    // CONNECT authority is "hostname:port" ("[v6]:port" for literals).
+    let host = null;
+    let portNum = 0;
+    const authority = req.url || "";
+    const v6 = authority.match(/^\[([^\]]+)\]:(\d+)$/);
+    if (v6) {
+      host = v6[1];
+      portNum = Number(v6[2]);
+    } else {
+      const idx = authority.lastIndexOf(":");
+      if (idx > 0) {
+        const h = authority.slice(0, idx);
+        const p = authority.slice(idx + 1);
+        if (h && /^\d+$/.test(p) && !h.includes(":")) {
+          host = h;
+          portNum = Number(p);
+        }
+      }
+    }
+    if (!host || !Number.isInteger(portNum)) {
+      deny(403, "Forbidden");
+      return;
+    }
+    // Hostname matched as an https-origin through the shared matcher.
+    const hostForUrl = host.includes(":") ? `[${host}]` : host;
+    const match = matchTarget(`https://${hostForUrl}`);
+    if (!match.matched) {
+      deny(403, "Forbidden");
+      return;
+    }
+    if (!isAuthorized(req, match)) {
+      deny(401, "Unauthorized");
+      return;
+    }
+    if (portNum !== 443 && portNum !== 80) {
+      deny(403, "Forbidden");
+      return;
+    }
+    // Raw pipe: reuse the SOCKS handshake with a plain (non-TLS) protocol so
+    // the socket stays untampered. Port is explicit here (443/80 allowed).
+    const rawConnect = socks5Connector(warpHost, warpPort, 30_000);
+    rawConnect({ hostname: host, port: portNum, protocol: "http:" }, (err, targetSocket) => {
+      if (err) {
+        console.error(`[relay #${index}] CONNECT error: ${err?.stack ?? String(err)}`);
+        deny(502, "Bad Gateway");
+        return;
+      }
+      targetSocket.on("error", () => {});
+      try {
+        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      } catch {
+        targetSocket.destroy();
+        return;
+      }
+      if (head && head.length) targetSocket.write(head);
+      clientSocket.pipe(targetSocket);
+      targetSocket.pipe(clientSocket);
+      const cleanup = () => {
+        try {
+          clientSocket.destroy();
+        } catch {
+          // Ignored.
+        }
+        try {
+          targetSocket.destroy();
+        } catch {
+          // Ignored.
+        }
+      };
+      clientSocket.once("close", cleanup);
+      targetSocket.once("close", cleanup);
+    });
+  });
   // A failed bind must be fatal: a half-started relay with missing listeners
   // is invisible to `restart: always` and only shows up as per-port 502s.
   server.on("error", (err) => {

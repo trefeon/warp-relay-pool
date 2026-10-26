@@ -95,9 +95,23 @@ Then manage your pool in agent chat:
 ## Security Model (Safe for Public Internet)
 
 Even when exposed over public TryCloudflare HTTPS URLs, the relay is strictly protected:
-- **Strict Target Allowlist:** The relay router (`server.mjs`) strictly enforces `RELAY_ALLOWED_TARGETS` (`https://opencode.ai`, `https://api.kilo.ai` by default).
+- **Strict Target Allowlist:** The relay router (`server.mjs`) strictly enforces `RELAY_ALLOWED_TARGETS` (`https://opencode.ai`, `https://api.kilo.ai`, `https://oai.endpoints.kepler.ai.cloud.ovh.net` by default).
 - Requests to any other origin (or malicious targets) return **HTTP 403 Forbidden** immediately.
 - Only inference streaming requests conforming to the `x-relay-target` protocol are forwarded.
+
+---
+
+## Universal Proxy Mode (Optional)
+
+Closed mode above is the default. One pool can also serve arbitrary
+upstreams via wildcard/suffix/regex allowlist entries (`*`, `*.suffix`,
+`re:<anchored-JS-regex>`) plus a shared `RELAY_AUTH_TOKEN` sent as
+`x-relay-auth` — see [docs/06-universal-proxy.md](docs/06-universal-proxy.md)
+for entry shapes, `CONNECT` / absolute-form usage, and token setup.
+
+Boundary: a wildcard entry without `RELAY_AUTH_TOKEN` is an open proxy —
+the token is mandatory there. Keep `3100+N` on loopback or the Tailscale
+IP; never publish relay ports to the open internet.
 
 ---
 
