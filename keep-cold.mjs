@@ -122,8 +122,11 @@
  *   PROBE_MODEL         legacy single-model override (used only when
  *                       PROBE_MODELS is unset)
  *   PROBE_FINGERPRINT   probe wire shape: legacy (default, current OpenCode
- *                       sextet+headers, byte-identical) or minimal (relay-only,
- *                       no fingerprint headers/tools)
+ *                       sextet+headers, byte-identical), env-only (legacy
+ *                       headers + env block, no tools), timestamp-only
+ *                       (legacy headers + tools + timestamp system prompt,
+ *                       no env block), or minimal (relay-only, no
+ *                       fingerprint headers/tools)
  *   GLOBAL_QUOTA_GUARD  relays-throttled threshold at which a model counts as
  *                       upstream quota (default max(8, COUNT-1), capped at COUNT)
  *   SERVER_ERROR_RETRY  same-egress re-probes before a server_error rotation
@@ -298,8 +301,8 @@ const PROBE_RESPONSES_PATH = envPath("PROBE_RESPONSES_PATH", "/inference/v1/resp
 
 const PROBE_MODELS_MODE = (process.env.PROBE_MODELS_MODE ?? "popular").trim().toLowerCase();
 const PROBE_FINGERPRINT = (process.env.PROBE_FINGERPRINT ?? "legacy").trim().toLowerCase();
-if (!["legacy", "minimal"].includes(PROBE_FINGERPRINT)) {
-  console.error(`keep-cold: PROBE_FINGERPRINT='${process.env.PROBE_FINGERPRINT}' must be legacy|minimal`);
+if (!["legacy", "minimal", "env-only", "timestamp-only"].includes(PROBE_FINGERPRINT)) {
+  console.error(`keep-cold: PROBE_FINGERPRINT='${process.env.PROBE_FINGERPRINT}' must be legacy|minimal|env-only|timestamp-only`);
   process.exit(2);
 }
 /** Pinned client version for the probe UA: the ecosystem's current pinned
@@ -514,8 +517,8 @@ const RESPONSE_PLACEHOLDER_TOOLS = FINGERPRINT_TOOLS.map((name) => ({
 
 /** Redacted fingerprint descriptor for 429 logs: mode + tool count + auth + sid prefix. Never logs the full session id or Bearer value. */
 function fpDescriptor(sid) {
-  const toolCount = PROBE_FINGERPRINT === "legacy" ? FINGERPRINT_TOOLS.length : 0;
-  const hasAuth = PROBE_FINGERPRINT === "legacy" && PROBE_TARGET.includes("opencode.ai") ? 1 : 0;
+  const toolCount = PROBE_FINGERPRINT === "legacy" || PROBE_FINGERPRINT === "timestamp-only" ? FINGERPRINT_TOOLS.length : 0;
+  const hasAuth = PROBE_FINGERPRINT !== "minimal" && PROBE_TARGET.includes("opencode.ai") ? 1 : 0;
   return `fp=${PROBE_FINGERPRINT}/tools=${toolCount}/auth=${hasAuth}/sid=${String(sid).slice(0, 10)}`;
 }
 
@@ -531,9 +534,29 @@ function fpDescriptor(sid) {
  * full reset still 429s everywhere, suspect the probe shape, not the pool. */
 const PROBE_SYSTEM_PROMPT = "You are a coding agent.\n<env>\n  Working directory: /tmp/keep-cold-probe\n</env>";
 
-/** Build the wire-path + body for a probed model (chat vs responses). */
+/** Timestamp-only system content for the fingerprint matrix: carries a fresh
+ * per-request timestamp but no `<env>` block, isolating whether the gate
+ * checks the env block specifically or just fresh system-prompt content.
+ * Built per call so every probe carries current time. */
+function timestampPrompt() {
+  return `You are a coding agent.\nCurrent time: ${new Date().toISOString()}`;
+}
+
+/** Build the wire-path + body for a probed model (chat vs responses).
+ * Matrix (headers stay legacy for every mode but minimal):
+ *   legacy ......... env block + tools (default, byte-identical)
+ *   env-only ....... env block, no tools (is the tools sextet gated?)
+ *   timestamp-only . timestamp system content + tools, no env block
+ *                    (is the env block specifically gated?)
+ *   minimal ........ neither (relay-only baseline) */
 function buildProbe(model) {
   const minimal = PROBE_FINGERPRINT === "minimal";
+  const withTools = PROBE_FINGERPRINT === "legacy" || PROBE_FINGERPRINT === "timestamp-only";
+  const sysContent = minimal
+    ? null
+    : PROBE_FINGERPRINT === "timestamp-only"
+      ? timestampPrompt()
+      : PROBE_SYSTEM_PROMPT;
   if (RESPONSES_MODELS.has(model)) {
     return {
       relayPath: PROBE_RESPONSES_PATH,
@@ -541,7 +564,7 @@ function buildProbe(model) {
         model,
         input: "ping",
         stream: true,
-        ...(minimal ? {} : { instructions: PROBE_SYSTEM_PROMPT, tools: RESPONSE_PLACEHOLDER_TOOLS }),
+        ...(minimal ? {} : { instructions: sysContent, ...(withTools ? { tools: RESPONSE_PLACEHOLDER_TOOLS } : {}) }),
       }),
     };
   }
@@ -552,14 +575,17 @@ function buildProbe(model) {
       stream: true,
       max_tokens: 4,
       messages: [
-        ...(minimal ? [] : [{ role: "system", content: PROBE_SYSTEM_PROMPT }]),
+        ...(minimal ? [] : [{ role: "system", content: sysContent }]),
         { role: "user", content: "ping" },
       ],
-      ...(minimal ? {} : { tools: PLACEHOLDER_TOOLS }),
+      ...(minimal || !withTools ? {} : { tools: PLACEHOLDER_TOOLS }),
     }),
   };
 }
 
+/** Legacy headers for legacy, env-only and timestamp-only alike: the matrix
+ * varies the body only, so header bytes stay comparable across modes. Only
+ * minimal strips down to relay-only headers. */
 function probeHeaders(relayPath, sidOverride) {
   const isOpenCode = PROBE_TARGET.includes("opencode.ai");
   const sid = sidOverride ?? sessionId();

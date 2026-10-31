@@ -946,6 +946,69 @@ test("legacy probe body carries exactly one env pair with Working directory", as
   assert.equal((rReq.sys.match(/Working directory:/g) ?? []).length, 1, `responses path carries Working directory: ${rReq.sys}`);
 });
 
+test("fingerprint matrix isolates body elements across four modes", async () => {
+  const sc = newScenario({ count: 1 });
+  await startRelays(sc);
+  const logPath = path.join(sc.dir, "relay-1.log");
+  async function lastReq(env) {
+    fs.writeFileSync(logPath, "");
+    const r = await runOnce(sc, { TARGET_MODEL: "model-a", ...env }, ["--probe"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    return JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  }
+  const legacy = await lastReq({});
+  assert.equal(legacy.tools, 6, "legacy keeps the tools sextet");
+  assert.equal((legacy.sys.match(/<env>/g) ?? []).length, 1, "legacy keeps one <env> pair");
+  assert.match(legacy.session, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  const envOnly = await lastReq({ PROBE_FINGERPRINT: "env-only" });
+  assert.equal(envOnly.tools, -1, "env-only drops tools");
+  assert.equal((envOnly.sys.match(/<env>/g) ?? []).length, 1, "env-only keeps one <env> pair");
+  assert.equal((envOnly.sys.match(/Working directory:/g) ?? []).length, 1);
+  assert.equal(envOnly.ua, legacy.ua, "env-only shares legacy headers");
+  assert.equal(envOnly.auth, legacy.auth, "env-only shares legacy auth");
+  assert.match(envOnly.session, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  const tsOnly = await lastReq({ PROBE_FINGERPRINT: "timestamp-only" });
+  assert.equal(tsOnly.tools, 6, "timestamp-only keeps the tools sextet");
+  assert.ok(tsOnly.sys.length > 0, "timestamp-only keeps system content");
+  assert.doesNotMatch(tsOnly.sys, /<env>/, "timestamp-only carries no <env> block");
+  assert.equal(tsOnly.ua, legacy.ua, "timestamp-only shares legacy headers");
+  assert.equal(tsOnly.auth, legacy.auth, "timestamp-only shares legacy auth");
+  assert.match(tsOnly.session, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  const minimal = await lastReq({ PROBE_FINGERPRINT: "minimal" });
+  assert.equal(minimal.tools, -1, "minimal sends no tools");
+  assert.equal(minimal.sys, "", "minimal sends no system block");
+  assert.equal(minimal.session, "", "minimal sends no session header");
+  async function lastResponsesReq(mode) {
+    fs.writeFileSync(logPath, "");
+    const r = await runOnce(sc, {
+      PROBE_MODELS: "dots-studio/dots-3-note-preview:free",
+      TARGET_MODEL: "dots-studio/dots-3-note-preview:free",
+      ...(mode === "legacy" ? {} : { PROBE_FINGERPRINT: mode }),
+    }, ["--probe"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    return JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  }
+  const rEnvOnly = await lastResponsesReq("env-only");
+  assert.equal(rEnvOnly.tools, -1, "responses env-only drops tools");
+  assert.equal((rEnvOnly.sys.match(/<env>/g) ?? []).length, 1, "responses env-only keeps one <env> pair");
+  const rTsOnly = await lastResponsesReq("timestamp-only");
+  assert.equal(rTsOnly.tools, 6, "responses timestamp-only keeps tools");
+  assert.doesNotMatch(rTsOnly.sys, /<env>/, "responses timestamp-only carries no <env> block");
+});
+
+test("429 scheduling log carries redacted fp descriptor in all four modes", async () => {
+  for (const [mode, tools] of [["env-only", 0], ["timestamp-only", 6]]) {
+    const sc = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429, retryAfter: 30 } } } });
+    await startRelays(sc);
+    const env = mode === "env-only" ? { PROBE_FINGERPRINT: "env-only" } : { PROBE_FINGERPRINT: "timestamp-only" };
+    const r = await runOnce(sc, env);
+    assert.equal(r.code, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, new RegExp(`#1 retry-after 30s — scheduling, no restart \\(fp=${mode}\\/tools=${tools}\\/auth=1\\/sid=.{10}\\)`));
+    assert.doesNotMatch(r.stdout, /Bearer public/);
+    assert.doesNotMatch(r.stdout, /ses_[0-9a-f]{12}[0-9A-Za-z]{14}/);
+  }
+});
+
 test("429 scheduling log carries redacted fp descriptor in both modes", async () => {
   const throttle = { 1: { "model-a": { status: 429, retryAfter: 30 } } };
   const scLegacy = newScenario({ count: 2, throttle });
