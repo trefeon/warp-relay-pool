@@ -23,11 +23,12 @@ const ALLOWED_TARGETS = (process.env.RELAY_ALLOWED_TARGETS ?? DEFAULT_ALLOWED_TA
   .split(",")
   .map((s) => s.trim().replace(/\/$/, ""))
   .filter(Boolean);
-// Shared token for wildcard/regex dispatches. Empty/unset disables the gate:
-// every allowlisted target passes without x-relay-auth. When set, targets
-// matched ONLY via wildcard ("*"/"*.suffix") or "re:" entries require
-// `x-relay-auth: <token>` (401 otherwise); exact-origin hits never need it
-// and the health path is exempt.
+// Shared token for wildcard/regex dispatches. Exact-origin hits never need
+// `x-relay-auth` and the health path is exempt. Targets matched ONLY via
+// wildcard ("*"/"*.suffix") or "re:" entries require
+// `x-relay-auth: <token>` (401 otherwise) — including when no token is
+// configured, so a wildcard/regex entry without RELAY_AUTH_TOKEN fails
+// closed instead of becoming an open proxy.
 const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || "";
 
 // Universal-proxy allowlist matcher. Each entry is one of:
@@ -83,8 +84,8 @@ function matchTarget(target) {
 }
 
 function isAuthorized(req, match) {
-  if (!RELAY_AUTH_TOKEN) return true;
   if (match.exact) return true;
+  if (!RELAY_AUTH_TOKEN) return false;
   return req.headers[HEADER_AUTH] === RELAY_AUTH_TOKEN;
 }
 

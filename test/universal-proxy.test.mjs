@@ -26,10 +26,14 @@ const EXACT_BASE = BASE;
 const WILD_BASE = BASE + 10;
 const SUF_BASE = BASE + 20;
 const RE_BASE = BASE + 30;
+const CLOSED_BASE = BASE + 40;
+const FAILCLOSED_BASE = BASE + 50;
 const EXACT_PORT = EXACT_BASE + 1;
 const WILD_PORT = WILD_BASE + 1;
 const SUF_PORT = SUF_BASE + 1;
 const RE_PORT = RE_BASE + 1;
+const CLOSED_PORT = CLOSED_BASE + 1;
+const FAILCLOSED_PORT = FAILCLOSED_BASE + 1;
 const TOKEN = "test-token-123";
 
 const CONNECTS = [];
@@ -129,8 +133,10 @@ function spawnRelay(basePort, allowlist, token) {
     WARP_HOST_1: "127.0.0.1",
     WARP_PORT_1: String(forwarder.address().port),
     RELAY_ALLOWED_TARGETS: allowlist,
+    // Explicit empty string (not inherit) so no-token relays deterministically
+    // exercise the fail-closed path even if the parent env sets a token.
+    RELAY_AUTH_TOKEN: token || "",
   };
-  if (token) env.RELAY_AUTH_TOKEN = token;
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: REPO_ROOT,
     env,
@@ -244,8 +250,15 @@ before(async () => {
   const exactTarget = `http://127.0.0.1:${upstream.address().port}`;
   await spawnRelay(EXACT_BASE, exactTarget, TOKEN);
   await spawnRelay(WILD_BASE, "*", TOKEN);
-  await spawnRelay(SUF_BASE, "*.example.com", "");
-  await spawnRelay(RE_BASE, "re:^http://.*\\.example\\.com$", "");
+  await spawnRelay(SUF_BASE, "*.example.com", TOKEN);
+  await spawnRelay(RE_BASE, "re:^http://.*\\.example\\.com$", TOKEN);
+  // Closed-mode: exact origins only, no token configured — the pi-freeflow
+  // default. Also carries https://example.com so CONNECT exact-exempt has a
+  // hostname target without needing another relay.
+  await spawnRelay(CLOSED_BASE, `${exactTarget},https://example.com`, "");
+  // Fail-closed: wildcard entry but no token configured — every wildcard
+  // dispatch must still be 401, never an open proxy.
+  await spawnRelay(FAILCLOSED_BASE, "*", "");
 });
 
 after(() => {
@@ -300,7 +313,7 @@ test("wildcard with a token dispatches and strips the auth header", async () => 
 
 test("*.suffix matches the apex and subdomains", async () => {
   for (const h of ["http://example.com", "http://foo.example.com", "http://a.b.example.com"]) {
-    const res = await get(SUF_PORT, { target: h });
+    const res = await get(SUF_PORT, { target: h, auth: TOKEN });
     assert.equal(res.status, 200, `${h} must dispatch`);
     const echo = JSON.parse(await res.text());
     assert.equal(echo.url, "/v1/models");
@@ -316,11 +329,14 @@ test("*.suffix rejects unrelated hosts with 403", async () => {
 
 test("re: entry dispatches matching origins and rejects the rest", async () => {
   const before = CONNECTS.length;
-  const hit = await get(RE_PORT, { target: "http://foo.example.com" });
+  const hit = await get(RE_PORT, { target: "http://foo.example.com", auth: TOKEN });
   assert.equal(hit.status, 200);
   assert.ok(CONNECTS.length > before);
   const miss = await get(RE_PORT, { target: "http://example.com" });
   assert.equal(miss.status, 403);
+  // Anchored: a suffix-attacker origin sharing the prefix must not dispatch.
+  const evil = await get(RE_PORT, { target: "http://foo.example.com.evil.com", auth: TOKEN });
+  assert.equal(evil.status, 403);
 });
 
 test("CONNECT pipes raw TCP on 443 with a token", async () => {
@@ -396,4 +412,99 @@ test("upstream redirects are not followed", async () => {
   const res = await get(WILD_PORT, { target, relayPath: "/redirect", auth: TOKEN });
   assert.equal(res.status, 502);
   assert.equal(secondHits, before);
+});
+
+test("closed-mode exact without any token stays usable (pi-freeflow default)", async () => {
+  const target = `http://127.0.0.1:${upstream.address().port}`;
+  const before = CONNECTS.length;
+  const res = await get(CLOSED_PORT, { target });
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(await res.text()).url, "/v1/models");
+  assert.ok(CONNECTS.length > before);
+});
+
+test("wildcard with no token configured fails closed (401, never dispatched)", async () => {
+  const target = `http://127.0.0.1:${upstream.address().port}`;
+  for (const auth of [undefined, TOKEN, "wrong"]) {
+    const before = CONNECTS.length;
+    const res = await get(FAILCLOSED_PORT, { target, auth });
+    assert.equal(res.status, 401);
+    assert.equal(CONNECTS.length, before);
+  }
+});
+
+test("* rejects non-http origins even with a token", async () => {
+  for (const target of ["ftp://example.com/file", "file:///etc/passwd", "gopher://example.com/1"]) {
+    const before = CONNECTS.length;
+    const res = await get(WILD_PORT, { target, auth: TOKEN });
+    assert.equal(res.status, 403, `${target} must be rejected`);
+    assert.equal(CONNECTS.length, before);
+  }
+});
+
+test("CONNECT pipes raw TCP on port 80 with a token", async () => {
+  const before = CONNECTS.length;
+  const { status, socket, rest } = await connectRaw(WILD_PORT, "example.com:80", { auth: TOKEN });
+  assert.equal(status, 200);
+  assert.deepEqual(CONNECTS.slice(before), ["example.com:80"]);
+  socket.write("GET /v1/models HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+  const initial = rest.length ? rest.toString() : "";
+  const reply = initial + (await readSocket(socket));
+  assert.match(reply, /HTTP\/1\.1 200/);
+});
+
+test("CONNECT to an exact origin works without a token", async () => {
+  const before = CONNECTS.length;
+  const { status, socket, rest } = await connectRaw(CLOSED_PORT, "example.com:443");
+  assert.equal(status, 200);
+  assert.deepEqual(CONNECTS.slice(before), ["example.com:443"]);
+  socket.write("GET /v1/models HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n");
+  const initial = rest.length ? rest.toString() : "";
+  const reply = initial + (await readSocket(socket));
+  assert.match(reply, /HTTP\/1\.1 200/);
+});
+
+test("DROP_HEADERS are stripped before upstream", async () => {
+  const target = `http://127.0.0.1:${upstream.address().port}`;
+  // Raw http.request: fetch forbids connection-level headers client-side, so
+  // only a raw socket proves the relay itself strips them.
+  const res = await new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port: WILD_PORT,
+        path: "/v1/models",
+        method: "GET",
+        headers: {
+          "x-relay-target": target,
+          "x-relay-path": "/v1/models",
+          "x-relay-auth": TOKEN,
+          "x-keep-cold-probe": "1",
+          connection: "close",
+          "proxy-connection": "keep-alive",
+          upgrade: "websocket",
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (d) => (data += d));
+        res.on("end", () => resolve({ status: res.statusCode, body: data }));
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+  assert.equal(res.status, 200);
+  const echo = JSON.parse(res.body);
+  assert.equal(echo.url, "/v1/models");
+  for (const h of [
+    "x-relay-target",
+    "x-relay-path",
+    "x-relay-auth",
+    "x-keep-cold-probe",
+    "proxy-connection",
+    "upgrade",
+  ]) {
+    assert.equal(echo.headers[h], undefined, `${h} must be stripped`);
+  }
 });

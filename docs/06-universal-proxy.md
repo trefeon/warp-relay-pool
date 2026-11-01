@@ -20,15 +20,16 @@ request **origin**:
 
 ## Token setup
 
-`RELAY_AUTH_TOKEN` empty/unset means disabled. When set, requests whose
-target matched **only** via a wildcard (`*`, `*.suffix`) or `re:` entry
-must carry `x-relay-auth: <token>` or they get `401`. Exact-origin matches
-never require it, and the no-target health check is always exempt.
-`x-relay-auth` is stripped before upstream (never forwarded).
+Requests whose target matched **only** via a wildcard (`*`, `*.suffix`)
+or `re:` entry must carry `x-relay-auth: <token>` or they get `401` —
+including when no token is configured, so a wildcard/regex entry without
+`RELAY_AUTH_TOKEN` fails closed instead of becoming an open proxy.
+Exact-origin matches never need it, and the no-target health check is
+always exempt. `x-relay-auth` is stripped before upstream (never forwarded).
 
-A wildcard/regex entry **requires** `RELAY_AUTH_TOKEN` — without it anyone
-who can reach the listener proxies anywhere. Pass the token via host env
-only; never commit it:
+A wildcard/regex entry **requires** `RELAY_AUTH_TOKEN` — without it those
+dispatches are rejected (`401`). Pass the token via host env only, never
+commit it:
 
 ```sh
 RELAY_AUTH_TOKEN=<token> ./generate-compose.sh 5 [--with-tunnels]

@@ -1,24 +1,32 @@
 # warp-relay-pool
 
-Self-hosted Docker/MicroWARP egress relay pool for AI coding agents ([pi-freeflow](https://github.com/trefeon/pi-freeflow), OMP, Pi).
-
-Provides N isolated Cloudflare WARP egress addresses paired with public HTTPS URLs via **Cloudflare Quick Tunnels (TryCloudflare)** or private static URLs via **Tailscale Mesh-VPN**. A background keep-cold prober automatically detects upstream HTTP 429 rate limits and rotates throttled WARP clients without changing your client URLs.
+Self-hosted WARP egress relay pool — one stack, two modes. N isolated
+Cloudflare WARP egress addresses with public HTTPS URLs via **Cloudflare
+Quick Tunnels (TryCloudflare)** or private static URLs via **Tailscale
+Mesh-VPN**, fronted by a per-port relay router.
 
 ```
-[OMP / Pi via pi-freeflow]
-          │
-          ├── TryCloudflare (Public HTTPS, zero client VPN) ──► https://<hash>.trycloudflare.com
-          └── Tailscale (Private Mesh-VPN direct)           ──► http://<tailscale-ip>:310N
-                    │
-                    ▼
-          [relay router :300N (10.244.0.100)]
-                    │  (per-port SOCKS5 forward)
-                    ▼
-          [MicroWARP SOCKS :1080 (Docker bridge 10.244.0.0/16)]
-                    │  (Alpine WireGuard + microsocks, ~1.8 MiB RAM/node)
-                    ▼
-          [Cloudflare Edge ──► Upstream API (opencode.ai / api.kilo.ai)]
+[any HTTP client via universal mode] ──┐
+                                       ├──► [relay router :300N (10.244.0.100)]
+[OMP / Pi via pi-freeflow] ────────────┘         │  (per-port SOCKS5 forward)
+                                                 ▼
+                                       [MicroWARP SOCKS :1080 (Docker bridge 10.244.0.0/16)]
+                                                 │  (Alpine WireGuard + microsocks, ~1.8 MiB RAM/node)
+                                                 ▼
+                                       [Cloudflare Edge ──► upstream API, egress <EGRESS-IP>]
 ```
+
+## Which track am I? (<60s)
+
+|  | Track A — Independent universal proxy | Track B — Specialized pi-freeflow pool |
+|---|---|---|
+| You are | Any HTTP client; you bring your own upstream | OMP/Pi user driving [pi-freeflow](https://github.com/trefeon/pi-freeflow) |
+| You get | Any upstream via allowlist + token, forward-proxy + `CONNECT`, own egress IPs, per-egress quota notes | Self-hosted WARP egress for OMP/Pi, keep-cold 429 rotation, `/freeflow` commands |
+| You run | `RELAY_AUTH_TOKEN=<token> ./generate-compose.sh 5 --with-tunnels` | `./setup.sh`, then paste the printed `/freeflow add` lines |
+| Detail lives | [docs/06-universal-proxy.md](docs/06-universal-proxy.md) — entry shapes, `CONNECT` / absolute-form, token setup | [docs/03-use-with-pi-freeflow.md](docs/03-use-with-pi-freeflow.md) — add/status/test/spread, health curls |
+
+How it works for both tracks: [docs/01-overview-how-it-works.md](docs/01-overview-how-it-works.md).
+Deploy paths for both ingress modes below; operations in [docs/](docs/README.md).
 
 ---
 
@@ -73,45 +81,49 @@ For most users and developers running parallel coding subagents, **5 relays** is
 
 ---
 
-## Connecting to Your Agent (`pi-freeflow`)
+## Connecting to Your Agent (Track B)
 
-Once `./setup.sh` completes, copy the printed commands and paste them into your OMP or Pi agent chat:
+`./setup.sh` prints ready-to-paste lines; full client flow (add, status,
+test, spread, health curls, allowlist) lives in
+[docs/03-use-with-pi-freeflow.md](docs/03-use-with-pi-freeflow.md):
 
 ```text
 /freeflow add https://<hash-1>.trycloudflare.com relay-1
 /freeflow add https://<hash-2>.trycloudflare.com relay-2
-/freeflow add https://<hash-3>.trycloudflare.com relay-3
-/freeflow add https://<hash-4>.trycloudflare.com relay-4
-/freeflow add https://<hash-5>.trycloudflare.com relay-5
 ```
-
-Then manage your pool in agent chat:
-- `/freeflow status` — check all configured relays and their active health
-- `/freeflow test` — run real upstream streaming inference tests across all relays
-- `/freeflow spread` — distribute parallel subagent tasks across all relays simultaneously
 
 ---
 
 ## Security Model (Safe for Public Internet)
 
-Even when exposed over public TryCloudflare HTTPS URLs, the relay is strictly protected:
-- **Strict Target Allowlist:** The relay router (`server.mjs`) strictly enforces `RELAY_ALLOWED_TARGETS` (`https://opencode.ai`, `https://api.kilo.ai`, `https://oai.endpoints.kepler.ai.cloud.ovh.net` by default).
-- Requests to any other origin (or malicious targets) return **HTTP 403 Forbidden** immediately.
-- Only inference streaming requests conforming to the `x-relay-target` protocol are forwarded.
+Applies to both tracks; full model and reporting in [SECURITY.md](SECURITY.md):
+- **Closed default (403):** the relay router (`server.mjs`) enforces
+  `RELAY_ALLOWED_TARGETS` (`https://opencode.ai`, `https://api.kilo.ai`,
+  `https://oai.endpoints.kepler.ai.cloud.ovh.net`). Any other origin
+  returns **HTTP 403 Forbidden**; upstream `3xx` redirects are refused
+  (`502`), so an allowlisted origin cannot steer the relay elsewhere.
+- **Wildcard-requires-token boundary (401):** wildcard/suffix/regex entries
+  (`*`, `*.suffix`, `re:…`, see [docs/06-universal-proxy.md](docs/06-universal-proxy.md))
+  widen the relay to arbitrary origins, so matches via wildcard alone must
+  carry `x-relay-auth: <token>` (else **401**; exact-origin matches never
+  need it, health check exempt). A wildcard entry with no
+  `RELAY_AUTH_TOKEN` configured is an open proxy for anyone who can reach
+  the listener.
+- **Bind guidance:** keep `3100+N` on loopback or the Tailscale IP; never
+  publish relay ports to the open internet. `x-relay-auth` is stripped and
+  never forwarded.
+- **Tunnel-URL-as-capability:** anyone holding a relay URL can make
+  allowlisted upstream requests through that relay's egress IP and read
+  that egress IP from the health check — treat relay URLs as sensitive
+  even though TryCloudflare URLs are public by construction.
 
 ---
 
-## Universal Proxy Mode (Optional)
+## Universal Proxy Mode (Track A)
 
-Closed mode above is the default. One pool can also serve arbitrary
-upstreams via wildcard/suffix/regex allowlist entries (`*`, `*.suffix`,
-`re:<anchored-JS-regex>`) plus a shared `RELAY_AUTH_TOKEN` sent as
-`x-relay-auth` — see [docs/06-universal-proxy.md](docs/06-universal-proxy.md)
-for entry shapes, `CONNECT` / absolute-form usage, and token setup.
-
-Boundary: a wildcard entry without `RELAY_AUTH_TOKEN` is an open proxy —
-the token is mandatory there. Keep `3100+N` on loopback or the Tailscale
-IP; never publish relay ports to the open internet.
+Closed mode above is the default. Track A detail (allowlist entry shapes,
+`RELAY_AUTH_TOKEN` / `x-relay-auth`, `CONNECT` / absolute-form usage, quota
+and egress notes) lives in [docs/06-universal-proxy.md](docs/06-universal-proxy.md).
 
 ---
 
@@ -168,7 +180,7 @@ node keep-cold.mjs --once
 | `generate-compose.sh` | Regenerate `docker-compose.yml`: `[count] [--with-tunnels] [--legacy-warp]` |
 | `get-status.sh` | Status script: prints public tunnel URLs, egress IPs, client commands |
 | `systemd/` | systemd service units and timers for keep-cold and logwatch |
-| `docs/` | Step-by-step technical guides (01–05) |
+| `docs/` | Step-by-step technical guides (01–06) |
 | `warp-lite/` | Minimal MicroWARP image source (Alpine WireGuard + microsocks, ~1.8 MiB runtime) |
 
 ---

@@ -21,7 +21,9 @@ The interactive wizard handles everything automatically:
 - On an existing deployment, adopts the deployed relay count and ingress
   mode unless `COUNT=`/`INGRESS=` are pinned (and removes orphan containers
   when the pool shrinks).
-- Prints the copy-paste `/freeflow add` commands ready for your agent.
+- Prints the copy-paste `/freeflow add` commands ready for your agent,
+  followed by the `/freeflow status|list|test|spread` next steps and the
+  auto/sticky/on/spread/off mode table (same footer as `./get-status.sh`).
 
 To run non-interactively with auto-detected recommendations:
 ```bash

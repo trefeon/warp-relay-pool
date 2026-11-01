@@ -68,6 +68,17 @@ mesh_ip() {
   fi
 }
 
+# Shared footer: every branch that prints paste-ready `/freeflow add` lines
+# ends with the same verify-then-spread next steps, so a re-run after a
+# reboot (fresh tunnel URLs) is still a complete client handoff.
+print_next_steps() {
+  echo ""
+  echo "Next: paste the lines above, then in your agent chat:"
+  echo "  /freeflow status | /freeflow list | /freeflow test | /freeflow spread"
+  echo "Modes: /freeflow auto (= sticky, default) | /freeflow on | /freeflow spread | /freeflow off"
+}
+ADD_PRINTED=0
+
 echo "=== WARP relay status (1..${COUNT}) ==="
 printf "%-10s %-8s %-34s %s\n" "INSTANCE" "PORT" "EGRESS IP" "TUNNEL URL"
 echo "--------------------------------------------------------------------------------------------"
@@ -189,6 +200,7 @@ while [ "$i" -le "$COUNT" ]; do
       echo "=== TryCloudflare Quick Tunnel commands (public HTTPS) ==="
     fi
     FOUND_TUNNELS=1
+    ADD_PRINTED=1
     echo "/freeflow add ${URL} relay-${i}"
   fi
   i=$((i + 1))
@@ -214,6 +226,7 @@ if [ "$FOUND_TUNNELS" -eq 0 ]; then
       echo "/freeflow add http://${TS_IP}:${TS_PORT} relay-${i}"
       i=$((i + 1))
     done
+    ADD_PRINTED=1
   else
     echo "=== Mesh-VPN direct commands (Tailscale private) ==="
     i=1
@@ -222,9 +235,13 @@ if [ "$FOUND_TUNNELS" -eq 0 ]; then
       echo "/freeflow add http://${ROUTER_BIND}:${TS_PORT} relay-${i}"
       i=$((i + 1))
     done
+    ADD_PRINTED=1
   fi
 else
   echo ""
   echo "=== Mesh-VPN direct: not published in tunnels mode ==="
   echo "(mesh ingress needs a mesh-mode deployment: ./generate-compose.sh ${COUNT})"
+fi
+if [ "$ADD_PRINTED" -eq 1 ]; then
+  print_next_steps
 fi

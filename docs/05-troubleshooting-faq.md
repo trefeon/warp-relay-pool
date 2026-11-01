@@ -8,7 +8,9 @@ split) — check `docker logs warp-relay-app` and host reachability, not
 egress rotation.
 
 **Tunnel URL changed (tunnels mode only).** Expected after any `tunnel-N`
-restart or host reboot — Quick Tunnels are ephemeral. Re-run
+restart or host reboot — Quick Tunnels are ephemeral. Relay rebuilds and
+per-egress 429 `warp-N` rotations never touch `tunnel-N`, so those keep
+URLs; only a tunnel restart/reboot mints new ones. Re-run
 `./get-status.sh` and re-paste the `/freeflow add <RELAY-N-URL> relay-N`
 lines. Never restart `tunnel-N` for a throttled relay; that trades a
 per-egress 429 for a pool-wide URL churn. See [04](04-operations-keep-cold.md).
@@ -16,7 +18,7 @@ Relay rebuilds can't cause this: tunnels carry no `depends_on: - relay`.
 
 **403 `Forbidden target`.** `x-relay-target` is not in the allowlist
 (`RELAY_ALLOWED_TARGETS`, default `https://opencode.ai`,
-`https://api.kilo.ai`). Fix the header (a trailing `/` is stripped for you)
+`https://api.kilo.ai`, `https://oai.endpoints.kepler.ai.cloud.ovh.net`). Fix the header (a trailing `/` is stripped for you)
 or set the env and re-run
 `./generate-compose.sh <count> [--with-tunnels] && docker compose up -d`
 (the generator bakes the allowlist into the relay service environment;

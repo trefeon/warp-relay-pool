@@ -1,10 +1,19 @@
 # 01 — Overview: how it works
 
+One stack, two modes — see [README track
+routing](../README.md#which-track-am-i-60s): Track A (independent universal
+proxy, any upstream via allowlist + token —
+[06-universal-proxy.md](06-universal-proxy.md)) and Track B (specialized
+pi-freeflow pool for OMP/Pi —
+[03-use-with-pi-freeflow.md](03-use-with-pi-freeflow.md)). This page
+describes the shared request path both tracks ride.
+
 Self-hosted Docker/WARP alternative to the Workers/Deno/Vercel relays
 [pi-freeflow](https://github.com/trefeon/pi-freeflow)'s `/freeflow deploy`
 creates — the OMP/Pi extension (npm `pi-freeflow`): same
 `x-relay-target`/`x-relay-path` protocol, same allowlist
-(`https://opencode.ai`, `https://api.kilo.ai`). Client-side failover lives
+(`https://opencode.ai`, `https://api.kilo.ai`,
+`https://oai.endpoints.kepler.ai.cloud.ovh.net`). Client-side failover lives
 there — see its [relays.md failover table](https://github.com/trefeon/pi-freeflow/blob/main/docs/pages/relays.md);
 this repo documents the relay side only, not its model catalog.
 One `relay` process exposes N listeners (`BASE_PORT+N`, default `3001`–`3000+N`).
@@ -15,8 +24,9 @@ Each listener forwards through its own MicroWARP client's SOCKS proxy
 2. **Mesh-VPN Direct (Tailscale):** Static private URLs (`http://<tailscale-ip>:310N`) published directly over an encrypted WireGuard mesh network.
 
 ```
-[OMP/Pi via pi-freeflow] ──► https://<hash>.trycloudflare.com (TryCloudflare, public HTTPS)
-                          └─► http://<tailscale-ip>:310N      (Mesh-VPN, static private)
+[any HTTP client via universal mode] ──┐
+                                       ├──► https://<hash>.trycloudflare.com (TryCloudflare, public HTTPS)
+[OMP/Pi via pi-freeflow] ──────────────┘ └─► http://<tailscale-ip>:310N      (Mesh-VPN, static private)
       ──► [relay :300N] ──► [MicroWARP SOCKS :1080] ──► [upstream API, egress <EGRESS-IP>]
 ```
 
@@ -37,7 +47,8 @@ Each listener forwards through its own MicroWARP client's SOCKS proxy
    returns `Relay #N OK (via socks5://warp-N:1080)` plus the trace body.
    A per-relay egress proof, not a load-balancer ping.
 5. Target not in the allowlist (`RELAY_ALLOWED_TARGETS`, default
-   `https://opencode.ai`, `https://api.kilo.ai`) = `403 {"error":"Forbidden target"}`.
+   `https://opencode.ai`, `https://api.kilo.ai`,
+   `https://oai.endpoints.kepler.ai.cloud.ovh.net`) = `403 {"error":"Forbidden target"}`.
    The allowlist covers every hop: upstream `3xx` redirects are refused
    (`502`), so an allowlisted origin cannot steer the relay elsewhere.
 
@@ -62,7 +73,7 @@ curl -s -N http://10.244.0.100:3001/v1/models \
 
 Running `./generate-compose.sh N --with-tunnels` pairs each relay port (`300N`) with a lightweight `cloudflare/cloudflared:latest` container (~18–20 MiB RAM).
 - **Zero configuration:** No Cloudflare account, custom domain, API token, or router port-forwarding needed. Cloudflare automatically issues a secure public HTTPS URL ending in `.trycloudflare.com`.
-- **Security allowlist:** Although the tunnel URLs are public, the relay router strictly rejects any request whose target is not in `RELAY_ALLOWED_TARGETS` (`opencode.ai`, `api.kilo.ai`) with `HTTP 403 Forbidden`.
+- **Security allowlist:** Although the tunnel URLs are public, the relay router strictly rejects any request whose target is not in `RELAY_ALLOWED_TARGETS` (`opencode.ai`, `api.kilo.ai`, `oai.endpoints.kepler.ai.cloud.ovh.net`) with `HTTP 403 Forbidden`.
 - **URL stability:** Tunnels run as independent sibling containers. Rebuilding the relay app or restarting WARP clients (for 429 rotation) does **not** restart the tunnels or change their URLs.
 
 ### 2. Mesh-VPN Direct (Tailscale)
