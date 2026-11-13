@@ -27,6 +27,13 @@ jobs:
         with:
           node-version: "22"
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.23"
+
+      - name: Bun toolchain parity
+        run: bun --version
+
       - name: JS syntax check
         run: |
           node --check server.mjs

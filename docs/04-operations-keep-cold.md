@@ -29,6 +29,7 @@ node keep-cold.mjs --sweep             # full sweep (what the timer runs)
 node keep-cold.mjs --once             # incremental pass: suspects + audit sample only
 INTERVAL_S=600 node keep-cold.mjs --loop   # incremental pass every 10 min, foreground
 node keep-cold.mjs --fresh-ip-sweep   # on-demand full reset sweep (wipes wg0.conf)
+node keep-cold.mjs --probe-matrix     # publish all exchanges across 4 fingerprint modes
 node keep-cold.mjs --help             # usage (unknown flags exit 2)
 ```
 
@@ -110,6 +111,28 @@ fresh addresses clears it. A 429 on every relay at once, surviving a full
 reset with retry-after counting down to 00:00 UTC, is either upstream quota
 (no rotation helps; the run reports it as quota-capped) or the probe shape
 itself being refused (check the prober; rotating the pool cannot fix that).
+
+### Fingerprint matrix publication (`--probe-matrix`)
+
+For live proof work, `--probe-matrix` runs all four probe fingerprints
+(`legacy`, `minimal`, `env-only`, `timestamp-only`) against every relay and
+publishes **every exchange** (`N/N`, no sampling) as JSON rows.
+
+Each row includes:
+- `t_utc`, `relay`, `mode`, `model`, `path`
+- relay `/64` prefix (`prefix64`)
+- `status`, `server_error`, `ms`
+- raw `retry-after` header plus parsed seconds
+- countdown to next UTC midnight and delta vs `retry-after`
+- `detail` (<=160 chars) and `envelope_head` (on HTTP 200)
+
+```bash
+PROBE_MATRIX_MODEL=deepseek-v4.1-flash-free \
+PROBE_MATRIX_OUT=.keep-cold/fingerprint-matrix.ndjson \
+node keep-cold.mjs --probe-matrix
+```
+
+`PROBE_MATRIX_OUT` is optional; when unset, rows are still printed to stdout.
 
 ## Cost control
 
@@ -199,6 +222,7 @@ to a baseline sweep, and the exit status is unaffected.
 | `COUNT` | `10` | Relays probed |
 | `PROBE_TARGET` | `https://opencode.ai` | Upstream the probes go through (defaults to OpenCode Zen inference with official fingerprint) |
 | `PROBE_CHAT_PATH` / `PROBE_RESPONSES_PATH` | `/inference/v1/chat/completions` / `/inference/v1/responses` | Wire paths under `PROBE_TARGET` |
+| `PROBE_MATRIX_MODEL` / `PROBE_MATRIX_OUT` | `deepseek-v4.1-flash-free` / unset | `--probe-matrix` model (chat path only) and optional NDJSON export file |
 | `PROBE_MODELS_MODE` | `popular` | Auto-probe filter: `popular` (focuses on daily main models `deepseek`, `glm`, `mimo`) or `all` |
 | `PROBE_MODELS` | Dynamically discovered free models | Free tag models auto-probed from OpenCode `/inference/v1/models` (survives model changes) |
 | `FRESH_IP_MODEL` | First model in `PROBE_MODELS` | Target model probed during `--fresh-ip-sweep` (defaults to `deepseek-v4.1-flash-free`) |

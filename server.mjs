@@ -119,7 +119,18 @@ const servers = [];
 // (Socks5ProxyAgent builds its Pool from dispatch options, which fetch never
 // sets), so the relay speaks SOCKS5 itself and hands undici a normal
 // connector. That keeps keep-alive/timeouts/connection caps effective.
-function socks5Connector(proxyHost, proxyPort, timeoutMs) {
+function socks5Connector(proxyHost, proxyPort, timeoutMs, stats) {
+  const markOpened = (sock, tlsSessionReused) => {
+    if (!stats) return;
+    stats.open += 1;
+    stats.opened += 1;
+    if (tlsSessionReused === true) stats.tlsResumed += 1;
+    else if (tlsSessionReused === false) stats.tlsNew += 1;
+    sock.once("close", () => {
+      stats.open = Math.max(0, stats.open - 1);
+      stats.closed += 1;
+    });
+  };
   return function connect(opts, callback) {
     const { hostname, protocol, servername } = opts;
     const port = opts.port || (protocol === "https:" ? 443 : 80);
@@ -191,6 +202,7 @@ function socks5Connector(proxyHost, proxyPort, timeoutMs) {
           if (protocol !== "https:") {
             // Any bytes after the reply already belong to the target.
             if (buf.length) socket.unshift(buf);
+            markOpened(socket, null);
             return finish(null, socket);
           }
           const secure = tls.connect({
@@ -198,7 +210,11 @@ function socks5Connector(proxyHost, proxyPort, timeoutMs) {
             servername: servername || hostname,
             ALPNProtocols: ["http/1.1"],
           });
-          secure.once("secureConnect", () => finish(null, secure));
+          secure.once("secureConnect", () => {
+            const reused = typeof secure.isSessionReused === "function" ? secure.isSessionReused() : false;
+            markOpened(secure, reused);
+            finish(null, secure);
+          });
           secure.once("error", (err) => finish(err));
           // The plain socket is owned by the TLS wrapper now; a late error on
           // it is already surfaced through the TLS socket.
@@ -267,9 +283,16 @@ function createRelayInstance(index) {
   const port = BASE_PORT + index;
   const warpHost = process.env[`WARP_HOST_${index}`] || `warp-${index}`;
   const warpPort = process.env[`WARP_PORT_${index}`] || "1080";
+  const transportStats = {
+    open: 0,
+    opened: 0,
+    closed: 0,
+    tlsNew: 0,
+    tlsResumed: 0,
+  };
   const proxyUrl = `socks5://${warpHost}:${warpPort}`;
   const dispatcher = new Agent({
-    connect: socks5Connector(warpHost, warpPort, 30_000),
+    connect: socks5Connector(warpHost, warpPort, 30_000, transportStats),
     keepAliveTimeout: 60_000,
     keepAliveMaxTimeout: 90_000,
     headersTimeout: 60_000,
@@ -315,6 +338,31 @@ function createRelayInstance(index) {
     // Direct health check: only when NO x-relay-target header is passed
     // (and the request line is not absolute-form). Exempt from the token gate.
     if (!target) {
+      let reqPath = "/";
+      try {
+        reqPath = new URL(req.url ?? "/", "http://relay.local").pathname;
+      } catch {
+        reqPath = "/";
+      }
+      if (reqPath === "/__relay_metrics") {
+        const mem = process.memoryUsage();
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        return res.end(JSON.stringify({
+          relay: index,
+          pid: process.pid,
+          t_utc: new Date().toISOString(),
+          inflight,
+          rss: mem.rss,
+          heapUsed: mem.heapUsed,
+          sockets: {
+            open: transportStats.open,
+            opened: transportStats.opened,
+            closed: transportStats.closed,
+            tlsNew: transportStats.tlsNew,
+            tlsResumed: transportStats.tlsResumed,
+          },
+        }));
+      }
       try {
         const trace = await fetch("https://cloudflare.com/cdn-cgi/trace", {
           dispatcher,

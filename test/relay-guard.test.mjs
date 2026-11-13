@@ -334,6 +334,21 @@ test("health check failure leaks no internals", async () => {
   assert.deepEqual(CONNECTS.slice(before), [`cloudflare.com:443`]);
 });
 
+test("metrics endpoint exposes rss and socket counters without upstream dispatch", async () => {
+  const before = CONNECTS.length;
+  const res = await fetch(`http://127.0.0.1:${RELAY_PORT}/__relay_metrics`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.relay, 1);
+  assert.equal(typeof body.rss, "number");
+  assert.equal(typeof body.inflight, "number");
+  assert.equal(typeof body.sockets?.open, "number");
+  assert.equal(typeof body.sockets?.opened, "number");
+  assert.equal(typeof body.sockets?.tlsNew, "number");
+  assert.equal(typeof body.sockets?.tlsResumed, "number");
+  assert.equal(CONNECTS.length, before);
+});
+
 test("non-allowlisted target still gets 403", async () => {
   const res = await hit("/v1/models", { target: "https://evil.tld" });
   assert.equal(res.status, 403);

@@ -1027,6 +1027,35 @@ test("429 scheduling log carries redacted fp descriptor in both modes", async ()
   assert.doesNotMatch(rMinimal.stdout, /ses_[0-9a-f]{12}[0-9A-Za-z]{14}/);
 });
 
+test("--probe-matrix publishes every exchange row with /64 and retry-after reconciliation", async () => {
+  const sc = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429, retryAfter: 30 } } } });
+  await startRelays(sc);
+  const outFile = path.join(sc.dir, "matrix.ndjson");
+  const r = await runOnce(sc, { PROBE_MATRIX_MODEL: "model-a", PROBE_MATRIX_OUT: outFile }, ["--probe-matrix"]);
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  const lines = fs.readFileSync(outFile, "utf8").trim().split("\n").filter(Boolean);
+  assert.equal(lines.length, 8, "2 relays x 4 fingerprint modes must be published");
+  const rows = lines.map((line) => JSON.parse(line));
+  const modes = new Set(rows.map((row) => row.mode));
+  assert.deepEqual([...modes].sort(), ["env-only", "legacy", "minimal", "timestamp-only"]);
+  assert.ok(rows.every((row) => row.path === "/inference/v1/chat/completions"));
+  assert.ok(rows.every((row) => row.model === "model-a"));
+  assert.ok(rows.every((row) => typeof row.t_utc === "string" && row.t_utc.endsWith("Z")));
+  assert.ok(rows.every((row) => row.prefix64 === "2a09:1:0:0"), "matrix rows carry /64 from relay trace");
+  const throttled = rows.filter((row) => row.relay === 1);
+  assert.equal(throttled.length, 4);
+  assert.ok(throttled.every((row) => row.status === 429));
+  assert.ok(throttled.every((row) => row.retry_after_raw === "30"));
+  assert.ok(throttled.every((row) => row.retry_after_s === 30));
+  assert.ok(throttled.every((row) => Number.isFinite(row.midnight_utc_s)));
+  assert.ok(throttled.every((row) => Number.isFinite(row.retry_after_minus_midnight_s)));
+  const clean = rows.filter((row) => row.relay === 2);
+  assert.equal(clean.length, 4);
+  assert.ok(clean.every((row) => row.status === 200));
+  assert.ok(clean.every((row) => typeof row.envelope_head === "string"));
+  assert.match(r.stdout, /matrix summary: published 8\/8 exchanges/);
+});
+
 test("auto-discovers popular free models (deepseek, glm, mimo) from OpenCode by default", async () => {
  const sc = newScenario({ count: 1 });
  await startRelays(sc);
