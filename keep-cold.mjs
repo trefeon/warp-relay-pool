@@ -159,19 +159,20 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const USAGE = `Usage: node keep-cold.mjs [--sweep|--once|--loop|--probe|--fresh-ip-sweep|--reset-until-clean] [--help]
+const USAGE = `Usage: node keep-cold.mjs [--sweep|--once|--loop|--probe|--probe-matrix|--fresh-ip-sweep|--reset-until-clean] [--help]
 
   --sweep            full-pool scan + rotate every rate-limited relay until clean
                      (what the systemd timer runs)
   --once             incremental pass: probe only suspects + audit sample
   --loop             incremental pass every INTERVAL_S seconds (foreground)
   --probe            read-only per-relay probe report (no rotation, no state writes)
+  --probe-matrix     read-only full exchange matrix (legacy|minimal|env-only|timestamp-only)
   --fresh-ip-sweep   full-pool tier-2 re-key + fresh IP verification + probe sweep
   --reset-until-clean smart targeted full reset of rate-limited relays until 200 OK
   --help             print this text and exit`;
 
 const argv = process.argv.slice(2);
-const unknownArgs = argv.filter((a) => !["--sweep", "--once", "--loop", "--probe", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
+const unknownArgs = argv.filter((a) => !["--sweep", "--once", "--loop", "--probe", "--probe-matrix", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
 if (unknownArgs.length) {
  console.error(`keep-cold: unknown argument(s): ${unknownArgs.join(" ")}`);
  console.error(USAGE);
@@ -182,15 +183,16 @@ if (argv.includes("--help") || argv.includes("-h")) {
  process.exit(0);
 }
 const PROBE_ONLY = argv.includes("--probe") || argv.includes("--status");
+const PROBE_MATRIX = argv.includes("--probe-matrix");
 const FRESH_IP_SWEEP = argv.includes("--fresh-ip-sweep");
 const RESET_UNTIL_CLEAN = argv.includes("--reset-until-clean");
 const SWEEP = argv.includes("--sweep");
 const LOOP = argv.includes("--loop");
 const ONCE = argv.includes("--once");
 
-const modeFlags = [ONCE, LOOP, PROBE_ONLY, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN, SWEEP].filter(Boolean);
+const modeFlags = [ONCE, LOOP, PROBE_ONLY, PROBE_MATRIX, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN, SWEEP].filter(Boolean);
 if (modeFlags.length > 1) {
- console.error("keep-cold: --sweep, --once, --loop, --probe, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
+ console.error("keep-cold: --sweep, --once, --loop, --probe, --probe-matrix, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
  process.exit(2);
 }
 
@@ -516,10 +518,10 @@ const RESPONSE_PLACEHOLDER_TOOLS = FINGERPRINT_TOOLS.map((name) => ({
 }));
 
 /** Redacted fingerprint descriptor for 429 logs: mode + tool count + auth + sid prefix. Never logs the full session id or Bearer value. */
-function fpDescriptor(sid) {
-  const toolCount = PROBE_FINGERPRINT === "legacy" || PROBE_FINGERPRINT === "timestamp-only" ? FINGERPRINT_TOOLS.length : 0;
-  const hasAuth = PROBE_FINGERPRINT !== "minimal" && PROBE_TARGET.includes("opencode.ai") ? 1 : 0;
-  return `fp=${PROBE_FINGERPRINT}/tools=${toolCount}/auth=${hasAuth}/sid=${String(sid).slice(0, 10)}`;
+function fpDescriptor(sid, fingerprint = PROBE_FINGERPRINT) {
+  const toolCount = fingerprint === "legacy" || fingerprint === "timestamp-only" ? FINGERPRINT_TOOLS.length : 0;
+  const hasAuth = fingerprint !== "minimal" && PROBE_TARGET.includes("opencode.ai") ? 1 : 0;
+  return `fp=${fingerprint}/tools=${toolCount}/auth=${hasAuth}/sid=${String(sid).slice(0, 10)}`;
 }
 
 /** System prompt carrying the environment block the OpenCode free tier gates on:
@@ -549,12 +551,12 @@ function timestampPrompt() {
  *   timestamp-only . timestamp system content + tools, no env block
  *                    (is the env block specifically gated?)
  *   minimal ........ neither (relay-only baseline) */
-function buildProbe(model) {
-  const minimal = PROBE_FINGERPRINT === "minimal";
-  const withTools = PROBE_FINGERPRINT === "legacy" || PROBE_FINGERPRINT === "timestamp-only";
+function buildProbe(model, fingerprint = PROBE_FINGERPRINT) {
+  const minimal = fingerprint === "minimal";
+  const withTools = fingerprint === "legacy" || fingerprint === "timestamp-only";
   const sysContent = minimal
     ? null
-    : PROBE_FINGERPRINT === "timestamp-only"
+    : fingerprint === "timestamp-only"
       ? timestampPrompt()
       : PROBE_SYSTEM_PROMPT;
   if (RESPONSES_MODELS.has(model)) {
@@ -586,10 +588,10 @@ function buildProbe(model) {
 /** Legacy headers for legacy, env-only and timestamp-only alike: the matrix
  * varies the body only, so header bytes stay comparable across modes. Only
  * minimal strips down to relay-only headers. */
-function probeHeaders(relayPath, sidOverride) {
+function probeHeaders(relayPath, sidOverride, fingerprint = PROBE_FINGERPRINT) {
   const isOpenCode = PROBE_TARGET.includes("opencode.ai");
   const sid = sidOverride ?? sessionId();
-  if (PROBE_FINGERPRINT === "minimal") {
+  if (fingerprint === "minimal") {
     return {
       "content-type": "application/json",
       "user-agent": "keep-cold/1.0",
@@ -847,17 +849,27 @@ async function readEnvelopeHead(res) {
  return head.slice(0, 4096);
 }
 
+function clip160(s) {
+ return String(s ?? "").replace(/\s+/g, " ").slice(0, 160);
+}
+
+function secondsToNextUtcMidnight(atMs) {
+ const d = new Date(atMs);
+ const next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0);
+ return Math.max(0, Math.round((next - atMs) / 1000));
+}
+
 // ── Probing ─────────────────────────────────────────────────────────
-async function probe(index, model) {
+async function probe(index, model, { fingerprint = PROBE_FINGERPRINT } = {}) {
   const url = `http://${RELAY_HOST}:${BASE_PORT + index}`;
-  const { relayPath, body } = buildProbe(model);
+  const { relayPath, body } = buildProbe(model, fingerprint);
   const sid = sessionId();
-  const fp = fpDescriptor(sid);
+  const fp = fpDescriptor(sid, fingerprint);
   const t0 = Date.now();
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: probeHeaders(relayPath, sid),
+      headers: probeHeaders(relayPath, sid, fingerprint),
       body,
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
@@ -868,31 +880,87 @@ async function probe(index, model) {
       try {
         head = await readEnvelopeHead(res);
       } catch (e) {
-        return { index, model, status: 0, serverError: false, detail: `body read failed: ${String(e?.message ?? e)}`.slice(0, 160), ms: Date.now() - t0, fp };
+         return { index, model, tUtc: new Date(t0).toISOString(), status: 0, serverError: false, detail: clip160(`body read failed: ${String(e?.message ?? e)}`), ms: Date.now() - t0, fp, retryAfterRaw: null, retryAfter: null, envelopeHead: "" };
       }
       const ms = Date.now() - t0;
-      if (SERVER_ERROR_RE.test(head)) {
-        const evt = /response\.failed/i.test(head) ? "response.failed" : /failed to generate/i.test(head) ? "failed to generate" : "server_error";
-        return { index, model, status: 200, serverError: true, detail: `envelope SSE ${evt}: ${head.replace(/\s+/g, " ").slice(0, 120)}`, ms, fp };
-      }
-      return { index, model, status: 200, serverError: false, detail: "", ms, fp };
-    }
-    const text = await res.text().catch(() => "");
-    const detail = text.replace(/\s+/g, " ").slice(0, 160);
-    // Numeric Retry-After only; an HTTP-date header is left to the gate.
-    const raRaw = res.status === 429 ? res.headers.get("retry-after") : null;
-    const retryAfter = raRaw && /^\d+$/.test(raRaw.trim()) ? Number(raRaw.trim()) : null;
-    return { index, model, status: res.status, serverError: isServerError(res.status, detail), detail, retryAfter, ms: Date.now() - t0, fp };
-  } catch (e) {
-    return { index, model, status: 0, serverError: false, detail: String(e?.message ?? e).slice(0, 160), ms: Date.now() - t0, fp };
-  }
+     const envelopeHead = clip160(head);
+     if (SERVER_ERROR_RE.test(head)) {
+         const evt = /response\.failed/i.test(head) ? "response.failed" : /failed to generate/i.test(head) ? "failed to generate" : "server_error";
+         return { index, model, tUtc: new Date(t0).toISOString(), status: 200, serverError: true, detail: clip160(`envelope SSE ${evt}: ${head}`), ms, fp, retryAfterRaw: null, retryAfter: null, envelopeHead };
+     }
+     return { index, model, tUtc: new Date(t0).toISOString(), status: 200, serverError: false, detail: "", ms, fp, retryAfterRaw: null, retryAfter: null, envelopeHead };
+   }
+   const text = await res.text().catch(() => "");
+   const detail = clip160(text);
+   // Numeric Retry-After only; an HTTP-date header is left to the gate.
+   const raRaw = res.status === 429 ? res.headers.get("retry-after") : null;
+   const retryAfter = raRaw && /^\d+$/.test(raRaw.trim()) ? Number(raRaw.trim()) : null;
+   return { index, model, tUtc: new Date(t0).toISOString(), status: res.status, serverError: isServerError(res.status, detail), detail, retryAfterRaw: raRaw, retryAfter, ms: Date.now() - t0, fp, envelopeHead: "" };
+ } catch (e) {
+   return { index, model, tUtc: new Date(t0).toISOString(), status: 0, serverError: false, detail: clip160(String(e?.message ?? e)), ms: Date.now() - t0, fp, retryAfterRaw: null, retryAfter: null, envelopeHead: "" };
+ }
 }
 
 /** Probe a set of models on one relay (serial — one relay, one egress). */
-async function probeRelay(index, models = PROBE_MODELS) {
+async function probeRelay(index, models = PROBE_MODELS, opts) {
  const out = [];
- for (const model of models) out.push(await probe(index, model));
+ for (const model of models) out.push(await probe(index, model, opts));
  return out;
+}
+
+/** --probe-matrix: publish every probe exchange across all four fingerprint modes. */
+async function probeFingerprintMatrix() {
+ const targetModel = process.env.PROBE_MATRIX_MODEL ?? "deepseek-v4.1-flash-free";
+ if (RESPONSES_MODELS.has(targetModel)) {
+ log(`probe-matrix requires a chat-path model; ${targetModel} is configured under PROBE_RESPONSES_PATH`);
+ return false;
+ }
+ const modes = ["legacy", "minimal", "env-only", "timestamp-only"];
+ const rows = [];
+ const outFile = (process.env.PROBE_MATRIX_OUT ?? "").trim();
+ if (outFile) {
+ fs.mkdirSync(path.dirname(outFile), { recursive: true });
+ fs.writeFileSync(outFile, "");
+ }
+ const total = COUNT * modes.length;
+ let exchange = 0;
+ const indexes = Array.from({ length: COUNT }, (_, i) => i + 1);
+ const perModeConcurrency = Math.min(PROBE_CONCURRENCY, 4);
+ for (const mode of modes) {
+ log(`matrix mode ${mode}: probing ${COUNT} relay(s) on ${targetModel} via ${PROBE_CHAT_PATH}`);
+ await runPool(indexes, perModeConcurrency, async (index) => {
+  const [res] = await probeRelay(index, [targetModel], { fingerprint: mode });
+  const ip = await getEgressIp(index);
+  const midnightS = res.status === 429 ? secondsToNextUtcMidnight(Date.parse(res.tUtc)) : null;
+  exchange += 1;
+  const row = {
+   exchange: `${exchange}/${total}`,
+   t_utc: res.tUtc,
+   relay: index,
+   mode,
+   model: targetModel,
+   path: PROBE_CHAT_PATH,
+   prefix64: egressPrefix(ip),
+   status: res.status,
+   server_error: res.serverError ? 1 : 0,
+   ms: res.ms,
+   retry_after_raw: res.retryAfterRaw ?? "",
+   retry_after_s: res.retryAfter,
+   midnight_utc_s: midnightS,
+   retry_after_minus_midnight_s:
+     (Number.isFinite(res.retryAfter) && Number.isFinite(midnightS)) ? res.retryAfter - midnightS : null,
+   detail: clip160(res.detail),
+   envelope_head: res.status === 200 ? clip160(res.envelopeHead) : "",
+   fp: res.fp,
+  };
+  rows.push(row);
+  const line = `matrix ${row.exchange} ${JSON.stringify(row)}`;
+  log(line);
+  if (outFile) fs.appendFileSync(outFile, `${JSON.stringify(row)}\n`);
+ });
+ }
+ log(`matrix summary: published ${rows.length}/${total} exchanges across ${modes.length} fingerprint modes`);
+ return rows.every((r) => r.status === 200 && r.server_error === 0);
 }
 
 /** Query a container's current egress IPv6 via Cloudflare trace. */
@@ -2026,6 +2094,9 @@ async function pass() {
 // ── Entry point ─────────────────────────────────────────────────────
 if (PROBE_ONLY) {
  const ok = await probePool();
+ process.exitCode = ok ? 0 : 1;
+} else if (PROBE_MATRIX) {
+ const ok = await probeFingerprintMatrix();
  process.exitCode = ok ? 0 : 1;
 } else if (SWEEP) {
  const ok = await sweep();

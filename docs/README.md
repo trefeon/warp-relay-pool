@@ -18,6 +18,9 @@ Numbered user journey. Read in order.
 6. [06 — Universal proxy mode](06-universal-proxy.md) — wildcard/suffix/regex
    allowlist entries, `RELAY_AUTH_TOKEN` setup, `CONNECT` / absolute-form
    usage, open-proxy warning and bind guidance.
+7. [07 — Transport + fingerprint live proof](07-transport-live-proof.md) —
+   live TLS capture checklist, 24h soak counters, and full matrix publication
+   workflow for transport validation.
 
 Privacy: live tunnel URLs and egress IPs never enter this repo — use
 `<RELAY-N-URL>` / `<EGRESS-IP>` / `<tailscale-ip>`. Real addresses live only
