@@ -441,6 +441,36 @@ else
   fi
 fi
 
+# Node engine. Default stays the locally built warp-lite (WireGuard); MASQUE
+# (MicroWARP, usque over HTTP/3 :443) is the escape hatch for hosts where the
+# WireGuard UDP handshake is dropped. Pin it non-interactively with
+# `NODE_ENGINE=microwarp ./setup.sh -y`.
+NODE_ENGINE_PINNED=0
+if [ -n "${NODE_ENGINE:-}" ]; then NODE_ENGINE_PINNED=1; else NODE_ENGINE="warp-lite"; fi
+case "$NODE_ENGINE" in
+  warp-lite|microwarp) ;;
+  *)
+    log_warn "NODE_ENGINE='${NODE_ENGINE}' is not warp-lite or microwarp; using warp-lite."
+    NODE_ENGINE="warp-lite"
+    ;;
+esac
+if [ "$AUTO_YES" != true ] && [ "$NODE_ENGINE_PINNED" -eq 0 ]; then
+  echo ""
+  printf "Node engine — [1] warp-lite WireGuard (default, ~1.8 MiB/node), [2] microwarp MASQUE over HTTP/3 (only when WireGuard UDP is blocked): "
+  read -r engine_choice || true
+  case "$engine_choice" in
+    2|masque|microwarp) NODE_ENGINE="microwarp" ;;
+  esac
+fi
+ENGINE_FLAG=""
+if [ "$NODE_ENGINE" = microwarp ]; then
+  ENGINE_FLAG=" --node-engine=microwarp"
+  log_info "Node engine: MicroWARP MASQUE (usque over HTTP/3 :443)."
+  log_warn "Each node needs its own device config: ./register-node.sh <N> (docs/08-masque-nodes.md)."
+else
+  log_info "Node engine: warp-lite (WireGuard + microsocks)."
+fi
+
 # -------------------------------------------------------------
 # 4. Build Minimal MicroWARP & Relay Images
 # -------------------------------------------------------------
@@ -455,12 +485,21 @@ if command -v systemctl >/dev/null 2>&1 && { [ "$(id -u)" -eq 0 ] || command -v 
   fi
 fi
 
-log_info "Building minimal MicroWARP image (warp-lite:latest, ~1.8 MiB RAM/node)..."
-docker build -t warp-lite:latest ./warp-lite
+if [ "$NODE_ENGINE" = warp-lite ]; then
+  # Built here, once, on purpose: no generated warp-N service declares a build
+  # context, so Compose cannot race several concurrent builds of the same tag
+  # (`AlreadyExists: image "warp-lite:latest" already exists`).
+  log_info "Building minimal MicroWARP image (warp-lite:latest, ~1.8 MiB RAM/node)..."
+  docker build -t warp-lite:latest ./warp-lite
+else
+  log_info "Pulling MicroWARP MASQUE image (ghcr.io/ccbkkb/microwarp:latest)..."
+  docker pull ghcr.io/ccbkkb/microwarp:latest
+fi
 
 log_info "Generating docker-compose.yml for ${COUNT} relays..."
-# shellcheck disable=SC2086
-sh ./generate-compose.sh "$COUNT" $WITH_TUNNELS_FLAG
+# shellcheck disable=SC2086 # both flags are built from fixed literals above
+sh ./generate-compose.sh "$COUNT" $WITH_TUNNELS_FLAG$ENGINE_FLAG
+
 
 # Shared scheduler state: the relay app bind-mounts ./.keep-cold at /signals
 # and writes signals.json as container root, while the host keep-cold prober
@@ -473,6 +512,8 @@ sh ./generate-compose.sh "$COUNT" $WITH_TUNNELS_FLAG
 install -d -m 0777 .keep-cold
 
 log_info "Starting containers with Docker Compose..."
+# --build rebuilds the relay app only (build: .); the node image is the one
+# built/pulled above — no warp-N service declares a build context.
 $DOCKER_COMPOSE up -d --build --remove-orphans
 
 # -------------------------------------------------------------

@@ -21,6 +21,10 @@ Numbered user journey. Read in order.
 7. [07 — Transport + fingerprint live proof](07-transport-live-proof.md) —
    live TLS capture checklist, 24h soak counters, and full matrix publication
    workflow for transport validation.
+8. [08 — MASQUE nodes (MicroWARP engine)](08-masque-nodes.md) — optional
+   second node engine for hosts where WireGuard UDP cannot establish:
+   `--node-engine=microwarp`, per-node device registration, SOCKS-routed
+   egress checks, restart-only rotation.
 
 Privacy: live tunnel URLs and egress IPs never enter this repo — use
 `<RELAY-N-URL>` / `<EGRESS-IP>` / `<tailscale-ip>`. Real addresses live only

@@ -131,6 +131,14 @@ and egress notes) lives in [docs/06-universal-proxy.md](docs/06-universal-proxy.
 
 If you prefer manual control over the compose generation and lifecycle:
 
+Build the node image **once** before the first `up`. Compose does not build it
+(every `warp-N` service references `image: warp-lite:latest` and none declares
+a build context, so Compose cannot race several builds of the same tag):
+
+```bash
+docker build -t warp-lite:latest ./warp-lite
+```
+
 ### Option A: TryCloudflare Quick Tunnels (Zero VPN required)
 ```bash
 ./generate-compose.sh 5 --with-tunnels
@@ -146,6 +154,10 @@ INGRESS_BIND=$(tailscale ip -4) ./generate-compose.sh 5
 docker compose up -d --build
 ./get-status.sh
 ```
+
+`--build` rebuilds only the relay app (`build: .`); the node image comes from
+the tag built above. Re-run that `docker build` line whenever `warp-lite/`
+changes.
 
 ---
 
@@ -177,7 +189,8 @@ node keep-cold.mjs --once
 | `keep-cold.mjs` | Two-tier 429 prober / rotator for MicroWARP backends (`--once` or `--loop`) |
 | `docker-compose.yml` | N × MicroWARP + relay app; tunnels appended only by `--with-tunnels` |
 | `Dockerfile` / `package.json` | Relay image (COPY-baked) / dependencies |
-| `generate-compose.sh` | Regenerate `docker-compose.yml`: `[count] [--with-tunnels] [--legacy-warp]` |
+| `generate-compose.sh` | Regenerate `docker-compose.yml`: `[count] [--with-tunnels] [--legacy-warp] [--node-engine=warp-lite\|microwarp] [--masque-proxy-mode=socks\|l4-socks]` |
+| `register-node.sh` | Provision one MASQUE node's device config (`state/warp-N/masque-config.json`) and verify its egress |
 | `get-status.sh` | Status script: prints public tunnel URLs, egress IPs, client commands |
 | `systemd/` | systemd service units and timers for keep-cold and logwatch |
 | `docs/` | Step-by-step technical guides (01–06) |

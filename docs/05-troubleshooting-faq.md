@@ -7,6 +7,17 @@ working, the fault is ingress-side (relay app down, host offline, tailnet
 split) — check `docker logs warp-relay-app` and host reachability, not
 egress rotation.
 
+**All relays `warp=off` with 0/N carrying traffic (WireGuard blocked).**
+Every `warp-N` container is healthy but no egress is WARP: the WireGuard
+UDP/2408 handshake never completes on this path while TCP/443 works. Switch
+the node engine — `./generate-compose.sh N --node-engine=microwarp`, then
+provision each node with `./register-node.sh <N>`. Same container names, same
+`warp-N:1080` SOCKS contract, no relay change. See
+[08](08-masque-nodes.md). Verify with the trace **through the node's SOCKS
+port** (`docker exec warp-relay-warp-N curl -s -x socks5h://127.0.0.1:1080
+https://www.cloudflare.com/cdn-cgi/trace`); a plain in-container curl on a
+MASQUE node reports the host address with `warp=off` and proves nothing.
+
 **Tunnel URL changed (tunnels mode only).** Expected after any `tunnel-N`
 restart or host reboot — Quick Tunnels are ephemeral. Relay rebuilds and
 per-egress 429 `warp-N` rotations never touch `tunnel-N`, so those keep

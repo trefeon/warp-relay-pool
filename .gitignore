@@ -5,6 +5,9 @@
 !.env.example
 # local compose overrides (never committed)
 docker-compose.override.yml
+# MASQUE (usque) per-node device configs hold private keys; register-node.sh
+# writes them here. Never commit.
+/state/
 # deps
 node_modules/
 # relay state snapshots (client-side pool state, never committed)

@@ -57,8 +57,12 @@ egress_ip() {
     printf '%s' "$ip"
     return
   fi
-  # 2. In-container docker exec fallback
-  docker exec "warp-relay-warp-$1" curl -s -m 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
+  # 2. In-container docker exec fallback, routed through the node's own SOCKS
+  # listener: on a MASQUE (usque) node a plain curl leaves the container
+  # without the tunnel and reports the host address with warp=off, so only the
+  # proxy form can answer with that node's egress.
+  docker exec "warp-relay-warp-$1" curl -s -m 8 -x socks5h://127.0.0.1:1080 \
+    https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
     | sed -n 's/^ip=//p' || true
 }
 
