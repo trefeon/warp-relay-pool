@@ -602,13 +602,46 @@ test("--fresh-ip-sweep identifies global upstream quota when all relays return 4
  assert.match(r.stdout, /global.*upstream.*quota/i);
 });
 
-test("--fresh-ip-sweep aborts during preflight if a container lacks wg0.conf", async () => {
+test("--fresh-ip-sweep treats a wg0-less node as MASQUE and rotates it by plain restart", async () => {
  const sc = newScenario({ count: 2 });
  await startRelays(sc);
- const r = await runOnce(sc, { FAKE_DOCKER_MISSING_WG0: "warp-relay-warp-2" }, ["--fresh-ip-sweep"]);
- assert.equal(r.code, 1, r.stdout + r.stderr);
- assert.deepEqual(restartLines(sc), [], "zero restarts performed on preflight failure");
- assert.match(r.stderr + r.stdout, /preflight|wg0\.conf/i);
+ const r = await runOnce(
+  sc,
+  { FAKE_DOCKER_MISSING_WG0: "warp-relay-warp-2", ROTATE_SPACING_MS: "0" },
+  ["--fresh-ip-sweep"],
+ );
+ const lines = dockerLines(sc);
+ assert.match(r.stdout, /1 WireGuard, 1 MASQUE\/restart-only/, "preflight reports the engine split instead of aborting");
+ assert.equal(
+  lines.filter((l) => l.includes("rm -f /etc/wireguard/wg0.conf")).length,
+  1,
+  "only the WireGuard node is re-keyed",
+ );
+ assert.ok(lines.some((l) => l.startsWith("restart warp-relay-warp-2")), "the MASQUE node still rotates, by plain restart");
+ assert.ok(!lines.some((l) => l.startsWith("exec warp-relay-warp-2 rm")), "its device registration is never deleted");
+});
+
+test("--reset-until-clean never deletes a MASQUE node's registration on tier-2", async () => {
+ const sc = newScenario({ count: 2, throttle: { 2: { "model-a": { status: 429 } } } });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  {
+   ROTATE_SPACING_MS: "0",
+   READY_TIMEOUT_MS: "4000",
+   MAX_RESET_ATTEMPTS: "1",
+   SOFT_ROTATIONS_BEFORE_TIER2: "1",
+   FAKE_DOCKER_MISSING_WG0: "warp-relay-warp-2",
+   FAKE_DOCKER_STICKY_RESTARTS: "1",
+   TARGET_MODEL: "model-a",
+  },
+  ["--reset-until-clean"],
+ );
+ const lines = dockerLines(sc);
+ assert.match(r.stdout, /1\/2 relay\(s\) WireGuard-rekeyable, 1 MASQUE\/restart-only/);
+ assert.equal(lines.filter((l) => l.includes("rm -f /etc/wireguard/wg0.conf")).length, 0, "no registration deleted");
+ assert.ok(restartLines(sc).some((l) => l.startsWith("restart warp-relay-warp-2")), "the node still rotates by restart");
+ assert.doesNotMatch(r.stdout, /escalating to a full reset/, "a MASQUE node cannot escalate");
 });
 
 test("--fresh-ip-sweep rejects mutual exclusion with --once or --loop", async () => {
@@ -772,7 +805,7 @@ test("--reset-until-clean rejects a new address inside the same throttled /64 an
  assert.match(r.stdout, /kept the same egress — escalating to a full reset/);
 });
 
-test("--reset-until-clean keeps rotating through multi-hour retry-after instead of halting", async () => {
+test("--reset-until-clean keeps rotating through a long retry-after when the horizon guard is off", async () => {
  let attempts = 0;
  const sc = newScenario({
   count: 2,
@@ -788,7 +821,7 @@ test("--reset-until-clean keeps rotating through multi-hour retry-after instead 
  await startRelays(sc);
  const r = await runOnce(
   sc,
-  { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "4", TARGET_MODEL: "model-a" },
+  { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "4", RETRY_AFTER_GIVE_UP_S: "0", TARGET_MODEL: "model-a" },
   ["--reset-until-clean"],
  );
  assert.equal(r.code, 0, r.stdout + r.stderr);
@@ -797,6 +830,22 @@ test("--reset-until-clean keeps rotating through multi-hour retry-after instead 
  assert.match(r.stdout, /retry-after: 25000/);
  assert.doesNotMatch(r.stdout, /Halting resets/);
  assert.match(r.stdout, /got 200 streaming \(CLEAN\)/);
+});
+
+test("--reset-until-clean gives up on a retry-after past the rotation horizon", async () => {
+ const sc = newScenario({ count: 2, throttle: { 2: { "model-a": { status: 429, retryAfter: 85000 } } } });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "4", TARGET_MODEL: "model-a" },
+  ["--reset-until-clean"],
+ );
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ assert.deepEqual(restartLines(sc), [], "no restart for a quota countdown a rotation cannot outlast");
+ assert.match(r.stdout, /retry-after 85000s exceeds the rotation horizon — parked until the next sweep/);
+ assert.match(r.stdout, /still rate-limited on model-a/);
+ const state = JSON.parse(fs.readFileSync(sc.stateFile, "utf8"));
+ assert.ok(state.relays["2"].probeAfter > Date.now(), "relay parked past the retry-after window");
 });
 
 test("--reset-until-clean keeps retrying a zero-yield round until MAX_RESET_ATTEMPTS", async () => {

@@ -41,12 +41,18 @@
  * chain that starts them at least ROTATE_SPACING_MS apart.
  *
  * A 429 carrying a numeric `retry-after` <= 120 s never restarts: it sets the
- * next probe time instead. Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
- * one Cloudflare registration) is used only for pure 429 batches, after two
+ * next probe time instead. A 429 whose retry-after exceeds
+ * RETRY_AFTER_GIVE_UP_S (default 900 s) is upstream quota counting down to a
+ * fixed reset, not a property of the address: every fresh egress answers the
+ * same countdown, so the relay is parked until the window expires instead of
+ * being rotated. Tier-2 (wipe /etc/wireguard/wg0.conf + restart, one
+ * Cloudflare registration) is used only for pure 429 batches, after two
  * failed post-restart verifications, and at most once per relay per
  * TIER2_MIN_INTERVAL_S; server_error and 502 rotations are tier-1 only. Nodes
- * without wg0.conf abort the re-key and fall back to a plain restart, leaving
- * their registration untouched.
+ * without wg0.conf are MASQUE (usque) nodes: tier-2 there is a plain restart
+ * that spends no registration and never escalates, and the egress trace goes
+ * through the node's own SOCKS listener (EGRESS_TRACE_SOCKS_PORT, default
+ * 1080) because a plain in-container curl leaves without the tunnel.
  *
  * Guardrails
  * ----------
@@ -405,6 +411,16 @@ const RESPONSES_MODELS = new Set(
 );
 const FRESH_IP_MODEL = process.env.FRESH_IP_MODEL ?? PROBE_MODELS[0];
 const MAX_RESET_ATTEMPTS = envInt("MAX_RESET_ATTEMPTS", 10, { min: 1, max: 50 });
+// A 429 whose retry-after outlasts any useful rotation window (observed
+// ~85000s = upstream free-tier quota counting down to 00:00 UTC) will 429
+// again on the next fresh egress, so rotating past it only churns the
+// container. 0 disables the guard (rotate regardless of retry-after).
+const RETRY_AFTER_GIVE_UP_S = envInt("RETRY_AFTER_GIVE_UP_S", 900, { min: 0 });
+// Egress trace port for MASQUE nodes: usque's SOCKS listener is the only
+// tunneled path there, so a plain in-container curl reports the host address
+// with warp=off. warp-lite is unaffected (its SOCKS listener is the same
+// tunnel and the plain path also leaves through wg0); set 0 to disable.
+const EGRESS_TRACE_SOCKS_PORT = envInt("EGRESS_TRACE_SOCKS_PORT", 1080, { min: 0, max: 65535 });
 const SOFT_ROTATIONS_BEFORE_TIER2 = envInt("SOFT_ROTATIONS_BEFORE_TIER2", 1, { min: 1, max: 50 });
 const GLOBAL_QUOTA_GUARD = Math.min(envInt("GLOBAL_QUOTA_GUARD", Math.max(8, COUNT - 1), { min: 1 }), COUNT);
 const MAX_POOL_REGISTRATIONS_PER_HOUR = envInt("MAX_POOL_REGISTRATIONS_PER_HOUR", 60, { min: 1, max: 200 });
@@ -963,19 +979,34 @@ async function probeFingerprintMatrix() {
  return rows.every((r) => r.status === 200 && r.server_error === 0);
 }
 
-/** Query a container's current egress IPv6 via Cloudflare trace. */
+/**
+ * Query a container's current egress IP via Cloudflare trace.
+ *
+ * The trace is tried through the container's own SOCKS listener first: on a
+ * MASQUE node (usque) that listener is the only tunneled path, and a plain
+ * curl exits the container without the tunnel — warp=off with the host
+ * address. On warp-lite the listener is the same WireGuard tunnel, so this
+ * path is equivalent; the plain exec stays as a fallback for images whose
+ * SOCKS port is closed. EGRESS_TRACE_SOCKS_PORT=0 restores the plain probe.
+ */
 async function getEgressIp(index) {
- try {
-  const out = await docker(["exec", containerName(index), "curl", "-s", "-m", "8", "https://cloudflare.com/cdn-cgi/trace"], 25_000);
-  const ipMatch = out.match(/^ip=(.+)$/m);
-  const warpMatch = out.match(/^warp=(.+)$/m);
-  if (ipMatch && warpMatch && warpMatch[1].trim() === "on") {
-   return ipMatch[1].trim();
+ const traceUrl = "https://cloudflare.com/cdn-cgi/trace";
+ const viaSocks = EGRESS_TRACE_SOCKS_PORT > 0
+  ? ["exec", containerName(index), "curl", "-s", "-m", "8", "-x", `socks5h://127.0.0.1:${EGRESS_TRACE_SOCKS_PORT}`, traceUrl]
+  : null;
+ const plain = ["exec", containerName(index), "curl", "-s", "-m", "8", traceUrl];
+ for (const args of [viaSocks, plain]) {
+  if (!args) continue;
+  try {
+   const out = await docker(args, 25_000);
+   const ipMatch = out.match(/^ip=(.+)$/m);
+   const warpMatch = out.match(/^warp=(.+)$/m);
+   if (ipMatch && warpMatch && warpMatch[1].trim() === "on") return ipMatch[1].trim();
+  } catch {
+   // Try the next path; both failing is "unknown egress", not an error.
   }
-  return null;
- } catch {
-  return null;
  }
+ return null;
 }
 
 /**
@@ -1028,6 +1059,19 @@ function isPrefixThrottled(prefix, file = PREFIX_BLACKLIST_FILE) {
  return exp > now();
 }
 
+/**
+ * A node is WireGuard-rekeyable when /etc/wireguard/wg0.conf exists. MASQUE
+ * (usque) nodes have none: they rotate by plain restart, never by a re-key, so
+ * a missing wg0.conf is a fact about the engine rather than a fault.
+ */
+async function hasWireGuardConfig(index) {
+ try {
+  await docker(["exec", containerName(index), "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+  return true;
+ } catch {
+  return false;
+ }
+}
 
 /**
  * --fresh-ip-sweep: serial full reset (tier-2) of every relay in the pool,
@@ -1038,20 +1082,12 @@ function isPrefixThrottled(prefix, file = PREFIX_BLACKLIST_FILE) {
 async function freshIpSweep() {
  const state = loadState();
  const initialIps = new Map();
-
  // ── Phase 1: Preflight ──
+ // Mixed pools are possible after a hand migration; a MASQUE node simply gets
+ // the restart-only rotation, so the sweep still verifies a fresh /64.
+ const rekeyable = new Map();
  for (let i = 1; i <= COUNT; i++) {
-  let hasWg0 = false;
-  try {
-   await docker(["exec", containerName(i), "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
-   hasWg0 = true;
-  } catch {
-   hasWg0 = false;
-  }
-  if (!hasWg0) {
-   log(`#${i} preflight failed: missing /etc/wireguard/wg0.conf — aborting fresh-IP sweep with zero mutations`);
-   return false;
-  }
+  rekeyable.set(i, await hasWireGuardConfig(i));
   const ip = await getEgressIp(i);
   if (!ip) {
    log(`#${i} preflight failed: unable to query egress IP`);
@@ -1059,7 +1095,8 @@ async function freshIpSweep() {
   }
   initialIps.set(i, ip);
  }
- log(`preflight passed: ${COUNT}/${COUNT} relays verified with active wg0.conf`);
+ const wgCount = [...rekeyable.values()].filter(Boolean).length;
+ log(`preflight passed: ${COUNT}/${COUNT} relays report an egress IP (${wgCount} WireGuard, ${COUNT - wgCount} MASQUE/restart-only)`);
 
  // ── Phase 2: Serial Full-Reset + IP verification + Probe ──
  const cleanRelays = [];
@@ -1071,6 +1108,11 @@ async function freshIpSweep() {
   const container = containerName(index);
   const at = await enqueueRestart(async () => {
    const started = now();
+   if (!rekeyable.get(index)) {
+    log(`#${index} full reset (t2) — MASQUE node, plain restart of ${container} (registration kept)`);
+    await docker(["restart", container], 60_000);
+    return started;
+   }
    log(`#${index} full reset (t2) — deleting wg0.conf and restarting ${container}`);
    await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
    await docker(["restart", container], 60_000);
@@ -1167,6 +1209,20 @@ async function rotateContainer(index, tier, attempt) {
  return enqueueRestart(async () => {
   const started = now();
   if (tier === 2) {
+   let rekeyable = true;
+   try {
+    await docker(["exec", container, "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+   } catch {
+    rekeyable = false;
+   }
+   if (!rekeyable) {
+    // MASQUE (usque) node: no WireGuard re-key exists, and deleting
+    // masque-config.json would destroy the device registration. A plain
+    // restart is the rotation primitive; it spends no registration.
+    log(`#${index} [attempt ${attempt}] full reset (t2) requested but ${container} has no wg0.conf (MASQUE) — plain restart, registration kept`);
+    await docker(["restart", container], 60_000);
+    return started;
+   }
    log(`#${index} [attempt ${attempt}] full reset (t2) — deleting wg0.conf and restarting ${container}`);
    await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
    await docker(["restart", container], 60_000);
@@ -1203,9 +1259,13 @@ async function waitForFreshIp(index, oldIp) {
  */
 async function resetRelayUntilClean(index, models, state) {
  let oldIp = await getEgressIp(index);
+ // MASQUE nodes have no wg0.conf: tier 2 there is a plain restart that spends
+ // no registration, so they never escalate and never consume the budget.
+ const rekeyable = await hasWireGuardConfig(index);
  let streak = 0;
  for (let attempt = 1; attempt <= MAX_RESET_ATTEMPTS; attempt++) {
   let tier = streak >= SOFT_ROTATIONS_BEFORE_TIER2 ? 2 : 1;
+  if (tier === 2 && !rekeyable) tier = 1;
   if (tier === 2 && !tier2Allowed(index)) {
    log(`#${index} [attempt ${attempt}] tier-2 budget for this relay is spent — soft restart instead`);
    tier = 1;
@@ -1220,7 +1280,8 @@ async function resetRelayUntilClean(index, models, state) {
 
   // A soft restart that cannot move the /64 is exactly what the full reset
   // exists for: re-register now instead of spending the next attempt.
-  if (!newIp && tier === 1) {
+  // On a MASQUE node there is nothing to re-key, so a stuck /64 just re-rolls.
+  if (!newIp && tier === 1 && rekeyable) {
    const ceilingHit = poolRegistrationsWithinHour(state, now()).length >= MAX_POOL_REGISTRATIONS_PER_HOUR;
    if (ceilingHit) {
     log(`[ceiling] pool-wide registration ceiling reached (${MAX_POOL_REGISTRATIONS_PER_HOUR}/hour) — #${index} cannot escalate to a full reset`);
@@ -1268,6 +1329,24 @@ async function resetRelayUntilClean(index, models, state) {
   }
   if (failing.every((r) => r.status === 429)) {
    rememberThrottledPrefix(pfx, failing[0].retryAfter || 3600);
+   // A retry-after past the rotation horizon is upstream quota, not this
+   // address: the next fresh egress 429s too. Park the relay instead of
+   // spending the remaining attempts on restarts that cannot help.
+   if (RETRY_AFTER_GIVE_UP_S > 0 && Number(failing[0].retryAfter) >= RETRY_AFTER_GIVE_UP_S) {
+    log(
+     `#${index} [attempt ${attempt}] retry-after ${failing[0].retryAfter}s exceeds the rotation horizon` +
+      ` — giving up until the next sweep (${failing[0].fp})`,
+    );
+    patchRelay(state, index, {
+     dirty: true,
+     lastProbe: now(),
+     pendingVerify: false,
+     probeAfter: now() + failing[0].retryAfter * 1000,
+     last429: { model: failing[0].model, ts: now() },
+     consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
+    });
+    return false;
+   }
    log(
     `#${index} [attempt ${attempt}] still 429 on the new egress` +
      (failing[0].retryAfter ? ` (retry-after: ${failing[0].retryAfter}s)` : "") +
@@ -1352,6 +1431,25 @@ async function sweep() {
    if (capped.length) log(`#${index} throttled only on quota-capped models (left alone)`);
    continue;
   }
+  // A retry-after past the rotation horizon is upstream quota: every fresh
+  // egress answers 429 with the same countdown, so queueing a restart would
+  // churn the container for nothing. Park the relay until the window expires.
+  const horizon = RETRY_AFTER_GIVE_UP_S > 0
+   ? rotatable.find((r) => Number.isFinite(r.retryAfter) && r.retryAfter >= RETRY_AFTER_GIVE_UP_S)
+   : undefined;
+  if (horizon) {
+   patchRelay(state, index, {
+    dirty: true,
+    lastProbe: now(),
+    pendingVerify: false,
+    probeAfter: now() + horizon.retryAfter * 1000,
+    last429: { model: horizon.model, ts: now() },
+    consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
+   });
+   leftAlone.push(index);
+   log(`#${index} retry-after ${horizon.retryAfter}s exceeds the rotation horizon — left alone until the next sweep`);
+   continue;
+  }
   log(`#${index} rate limited on ${rotatable.map((r) => r.model).join(", ")} — queued for reset`);
   toReset.push(index);
  }
@@ -1382,19 +1480,12 @@ async function resetUntilClean() {
  const targetModel = process.env.TARGET_MODEL ?? process.env.FRESH_IP_MODEL ?? PROBE_MODELS[0];
 
  // ── Preflight ──
- for (let i = 1; i <= COUNT; i++) {
-  let hasWg0 = false;
-  try {
-   await docker(["exec", containerName(i), "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
-   hasWg0 = true;
-  } catch {
-   hasWg0 = false;
-  }
-  if (!hasWg0) {
-   log(`#${i} preflight failed: missing /etc/wireguard/wg0.conf`);
-   return false;
-  }
- }
+ // MASQUE (usque) nodes have no wg0.conf and are rotated by plain restart, so
+ // the sweep must not abort on them; record which tier each node supports.
+ const rekeyable = new Map();
+ for (let i = 1; i <= COUNT; i++) rekeyable.set(i, await hasWireGuardConfig(i));
+ const wgCount = [...rekeyable.values()].filter(Boolean).length;
+ log(`preflight: ${wgCount}/${COUNT} relay(s) WireGuard-rekeyable, ${COUNT - wgCount} MASQUE/restart-only`);
 
  // ── Baseline Evaluation ──
  log(`evaluating pool baseline for ${COUNT} relay(s) on ${targetModel}...`);
@@ -1404,6 +1495,9 @@ async function resetUntilClean() {
  // unreachable) is not an egress problem: a reset cannot fix it and would burn
  // a Cloudflare registration for nothing.
  const unusable = new Map();
+ // Relays parked on an upstream-quota retry-after: still rate-limited, so they
+ // must not be counted clean in the exit status.
+ const parked = new Set();
  const allIndexes = Array.from({ length: COUNT }, (_, i) => i + 1);
 
  await runPool(allIndexes, PROBE_CONCURRENCY, async (index) => {
@@ -1411,6 +1505,21 @@ async function resetUntilClean() {
   if (res.status === 200 && !res.serverError) {
    cleanIndexes.push(index);
   } else if (res.status === 429) {
+   // A countdown past the rotation horizon is upstream quota: the baseline
+   // already proves a restart cannot help, so never start one.
+   if (RETRY_AFTER_GIVE_UP_S > 0 && Number(res.retryAfter) >= RETRY_AFTER_GIVE_UP_S) {
+    parked.add(index);
+    patchRelay(state, index, {
+     dirty: true,
+     lastProbe: now(),
+     pendingVerify: false,
+     probeAfter: now() + res.retryAfter * 1000,
+     last429: { model: res.model, ts: now() },
+     consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
+    });
+    log(`#${index} retry-after ${res.retryAfter}s exceeds the rotation horizon — parked until the next sweep`);
+    return;
+   }
    throttledIndexes.push(index);
   } else {
    unusable.set(index, `${res.status || "unreachable"} ${res.detail}`.slice(0, 120));
@@ -1423,6 +1532,10 @@ async function resetUntilClean() {
   log(`#${index} not an egress rate limit (${why}) — left alone`);
  }
  if (pending.length === 0) {
+  if (parked.size > 0) {
+   log(`no relay to rotate: ${parked.size} parked on an upstream-quota retry-after — still rate-limited on ${targetModel}`);
+   return false;
+  }
   log(unusable.size === 0 ? `all relays already clean on ${targetModel}` : `no rate-limited relay to reset on ${targetModel}`);
   return unusable.size === 0;
  }
@@ -1438,6 +1551,7 @@ async function resetUntilClean() {
  // runs out; a multi-hour retry-after applies to the address being abandoned,
  // never to the pool, so it never halts the loop.
  const softStreak = new Map();
+ // (parked relays are tracked by the `parked` set declared before the baseline)
  for (let attempt = 1; attempt <= MAX_RESET_ATTEMPTS && pending.length > 0; attempt++) {
   log(`round ${attempt}/${MAX_RESET_ATTEMPTS}: rotating ${pending.length} rate-limited relay(s)...`);
   const nextPending = [];
@@ -1446,6 +1560,10 @@ async function resetUntilClean() {
    const oldIp = await getEgressIp(index);
    const streak = softStreak.get(index) ?? 0;
    let tier = streak >= SOFT_ROTATIONS_BEFORE_TIER2 ? 2 : 1;
+   // A MASQUE node has no wg0.conf: tier 2 there is a plain restart that
+   // spends no registration but also cannot re-key, so keep it out of the
+   // registration ceiling and never log it as an escalation.
+   if (tier === 2 && !rekeyable.get(index)) tier = 1;
    if (tier === 2 && poolRegistrationsWithinHour(state, now()).length >= MAX_POOL_REGISTRATIONS_PER_HOUR) {
     log(`[ceiling] Pool-wide registration ceiling reached (${MAX_POOL_REGISTRATIONS_PER_HOUR}/hour) — #${index} stays on soft restarts this round`);
     tier = 1;
@@ -1456,7 +1574,8 @@ async function resetUntilClean() {
 
    // A soft restart that cannot move the egress is exactly the case the full
    // reset exists for: re-register the device and try again immediately.
-   if (!newIp && tier === 1) {
+   // A MASQUE node has nothing to re-key, so a stuck /64 just re-rolls.
+   if (!newIp && tier === 1 && rekeyable.get(index)) {
     if (poolRegistrationsWithinHour(state, now()).length >= MAX_POOL_REGISTRATIONS_PER_HOUR) {
      log(`[ceiling] Pool-wide registration ceiling reached (${MAX_POOL_REGISTRATIONS_PER_HOUR}/hour) — #${index} cannot escalate to a full reset this round`);
     } else {
@@ -1498,6 +1617,24 @@ async function resetUntilClean() {
     softStreak.delete(index);
    } else if (res.status === 429) {
     rememberThrottledPrefix(pfx, res.retryAfter || 3600);
+    // A retry-after longer than any rotation horizon is upstream quota, not
+    // this address: the next fresh egress answers 429 too. Stop rotating and
+    // park the relay until the window expires instead of churning restarts.
+    if (RETRY_AFTER_GIVE_UP_S > 0 && Number(res.retryAfter) >= RETRY_AFTER_GIVE_UP_S) {
+     log(`#${index} (retry-after: ${res.retryAfter}s) exceeds the rotation horizon — giving up until the next sweep (${res.fp})`);
+     patchRelay(state, index, {
+      dirty: true,
+      lastProbe: now(),
+      pendingVerify: false,
+      probeAfter: now() + res.retryAfter * 1000,
+      last429: { model: res.model, ts: now() },
+      consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
+     });
+     softStreak.delete(index);
+     // Parked, not clean: the exit status must say so.
+     parked.add(index);
+     continue;
+    }
     log(
       `#${index}` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : "") +
       ` — rotating again for a clean address (${res.fp})`,
@@ -1514,9 +1651,9 @@ async function resetUntilClean() {
  }
 
  // ── Summary & Exit ──
- const totalClean = COUNT - pending.length - unusable.size;
- log(`smart reset finished: ${totalClean}/${COUNT} relays clean, ${pending.length} still rate-limited, ${unusable.size} not resettable`);
- if (pending.length === 0 && unusable.size === 0) {
+ const totalClean = COUNT - pending.length - unusable.size - parked.size;
+ log(`smart reset finished: ${totalClean}/${COUNT} relays clean, ${pending.length + parked.size} still rate-limited, ${unusable.size} not resettable`);
+ if (pending.length === 0 && unusable.size === 0 && parked.size === 0) {
   log(`success: all relays streaming 200 OK (all clean) on ${targetModel} — reset complete`);
   return true;
  }

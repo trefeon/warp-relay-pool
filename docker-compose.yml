@@ -18,7 +18,6 @@ networks:
 services:
   warp-1:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-1
     restart: always
     cap_add:
@@ -44,7 +43,6 @@ services:
 
   warp-2:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-2
     restart: always
     cap_add:
@@ -70,7 +68,6 @@ services:
 
   warp-3:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-3
     restart: always
     cap_add:
@@ -96,7 +93,6 @@ services:
 
   warp-4:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-4
     restart: always
     cap_add:
@@ -122,7 +118,6 @@ services:
 
   warp-5:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-5
     restart: always
     cap_add:
@@ -148,7 +143,6 @@ services:
 
   warp-6:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-6
     restart: always
     cap_add:
@@ -174,7 +168,6 @@ services:
 
   warp-7:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-7
     restart: always
     cap_add:
@@ -200,7 +193,6 @@ services:
 
   warp-8:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-8
     restart: always
     cap_add:
@@ -226,7 +218,6 @@ services:
 
   warp-9:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-9
     restart: always
     cap_add:
@@ -252,7 +243,6 @@ services:
 
   warp-10:
     image: warp-lite:latest
-    build: ./warp-lite
     container_name: warp-relay-warp-10
     restart: always
     cap_add:

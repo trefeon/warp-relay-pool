@@ -20,7 +20,8 @@ Every 5 minutes (≤ 10 relays) or 15 minutes (> 10 relays):
 
 - **Two-Tier Rotation:**
   - **Tier 1 (Default):** `docker restart` with `wg0.conf` kept — same keys, fresh `/64`, zero Cloudflare registrations.
-  - **Tier 2 (Fallback):** Deletes `wg0.conf` and restarts — new keypair, one Cloudflare registration. Escalates when a soft restart cannot move the `/64` block, at most once per relay per `TIER2_MIN_INTERVAL_S`.
+  - **Tier 2 (Fallback):** Deletes `wg0.conf` and restarts — new keypair, one Cloudflare registration. Escalates when a soft restart cannot move the `/64` block, at most once per relay per `TIER2_MIN_INTERVAL_S`. On a MASQUE (usque) node there is no `wg0.conf`: tier 2 is a plain restart there, spends no registration, and never escalates (see [08 — MASQUE nodes](08-masque-nodes.md)).
+- **Quota horizon:** a 429 whose `retry-after` is at or above `RETRY_AFTER_GIVE_UP_S` (default 900 s) is upstream quota counting down to a fixed reset — every fresh egress answers the same countdown. Such a relay is parked until the window expires instead of being rotated, which is what kept MASQUE nodes restarting 22×/hour without changing their egress. `RETRY_AFTER_GIVE_UP_S=0` restores unconditional rotation.
 - **Egress Rotation in Sweep:** In `--sweep` mode, every relay answering HTTP 429 is treated as having a throttled egress address and rotated until clean (`SWEEP_QUOTA_GUARD=0` by default so pool-wide 429 waves never halt rotation). In incremental `--once` mode, `GLOBAL_QUOTA_GUARD` still prevents rotation if a model is throttled pool-wide.
 - Concurrency: `ROTATE_CONCURRENCY` (default `1`) serialises restarts; `ROTATE_SPACING_MS` adds a mandatory gap between each.
 
@@ -252,6 +253,8 @@ to a baseline sweep, and the exit status is unaffected.
 | `MAX_RESET_ATTEMPTS` | `10` | Rotation rounds `--reset-until-clean` spends per relay before giving up |
 | `SOFT_ROTATIONS_BEFORE_TIER2` | `1` | Soft restarts that moved the address but still 429 before escalating to a full reset |
 | `MAX_POOL_REGISTRATIONS_PER_HOUR` | `60` | Pool-wide Cloudflare registration ceiling (tier-2 only; soft restarts are not gated) |
+| `RETRY_AFTER_GIVE_UP_S` | `900` | Retry-after at or above this parks the relay until the window expires instead of rotating (upstream quota, not the egress). `0` disables |
+| `EGRESS_TRACE_SOCKS_PORT` | `1080` | In-container trace port; the egress probe goes through the node's own SOCKS listener first, required for MASQUE nodes. `0` restores the plain probe |
 | `READY_TIMEOUT_MS` / `PROBE_TIMEOUT_MS` | `180000` / `30000` | `READY_TIMEOUT_MS` bounds the fresh-egress wait in the reset commands; `PROBE_TIMEOUT_MS` is the per-probe timeout |
 | `INTERVAL_S` | `300` | `--loop` seconds between passes |
 | `KEEP_COLD_LOG` (+ `_MAX_BYTES` / `_KEEP_BYTES`) | stdout only / `2 MiB` / `200 KiB` | Optional file log with self-rotation |

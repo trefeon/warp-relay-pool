@@ -34,6 +34,20 @@ To run non-interactively with auto-detected recommendations:
 
 ## Manual Deployment
 
+### Build the node image once
+
+```bash
+docker build -t warp-lite:latest ./warp-lite
+```
+
+Compose never builds this image: every `warp-N` service references
+`image: warp-lite:latest` and no service declares a build context, so
+`docker compose up -d --build` builds only the relay app (`build: .`). One
+explicit build keeps the tag from being built concurrently through several
+services, which fails with
+`AlreadyExists: image "warp-lite:latest" already exists`. Re-run this line
+after changing `warp-lite/`; `setup.sh` performs it automatically.
+
 ### Option A: TryCloudflare Quick Tunnels (Recommended for public access)
 
 ```bash
